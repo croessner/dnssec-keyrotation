@@ -70,7 +70,7 @@ jobs:
           asset="dnssec-keyrotation-${{ matrix.goos }}-${{ matrix.goarch }}"
           mkdir -p "dist/$asset/bin" "dist/$asset/docs" "dist/$asset/configs"
           cp build/dnssecctl "dist/$asset/bin/"
-          cp README.md POLICY.md "dist/$asset/"
+          cp LICENSE README.md POLICY.md "dist/$asset/"
           cp docs/spec.md "dist/$asset/docs/"
           cp configs/config.example.yaml "dist/$asset/configs/"
           tar -C dist -czf "dist/$asset.tar.gz" "$asset"

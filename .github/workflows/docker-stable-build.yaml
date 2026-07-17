@@ -98,6 +98,7 @@ jobs:
             echo "EOF"
             echo "labels<<EOF"
             echo "org.opencontainers.image.description=DNSSEC key-rotation controller and CLI"
+            echo "org.opencontainers.image.licenses=AGPL-3.0-or-later"
             echo "org.opencontainers.image.revision=$GITHUB_SHA"
             echo "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY"
             echo "org.opencontainers.image.version=$version"

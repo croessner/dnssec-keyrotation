@@ -13,7 +13,7 @@ IMAGE ?= registry.example.test/example/dnssec-keyrotation
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf none)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-.PHONY: all check fmt-check test race vet lint build build-linux govulncheck gosec trivy-config security guardrails release-guardrails openapi-check image
+.PHONY: all check fmt-check test race vet lint build build-linux govulncheck gosec trivy-config security guardrails release-guardrails openapi-check license-check image
 all: check build
 
 fmt-check:
@@ -45,6 +45,12 @@ openapi-check:
 	@rg -q '^  /v1/rotations/resume:' api/openapi.yaml
 	@rg -q '^  /v1/enrollment/arm:' api/openapi.yaml
 
+license-check:
+	@test -s LICENSE
+	@rg -q '^ +GNU AFFERO GENERAL PUBLIC LICENSE$$' LICENSE
+	@rg -q 'AGPL-3\.0-or-later' README.md Dockerfile
+	@rg -q 'cp LICENSE README\.md POLICY\.md' .github/workflows/release.yaml
+
 check: fmt-check test vet openapi-check
 
 build:
@@ -70,7 +76,7 @@ trivy-config:
 
 security: race govulncheck gosec trivy-config
 
-guardrails: fmt-check vet lint test race build-linux openapi-check
+guardrails: fmt-check vet lint test race build-linux openapi-check license-check
 
 release-guardrails: guardrails govulncheck gosec trivy-config
 

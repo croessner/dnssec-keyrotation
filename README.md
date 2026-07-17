@@ -55,3 +55,9 @@ During this pre-enrollment transition PowerDNS can report the recorded replaceme
 Production deployment files are intentionally kept outside the public source tree. A deployment should use host networking only when required to reach loopback PowerDNS, a scratch image, a numeric non-root user, a read-only root filesystem, no capabilities, no-new-privileges, file-backed secrets, bounded resources, and an exclusive persisted-state lock.
 
 Example release images use `registry.example.test/example/dnssec-keyrotation:<tag>`; production deployments should pin the verified digest.
+
+## License
+
+The original project code and documentation are licensed under the GNU Affero General Public License version 3 or any later version (`AGPL-3.0-or-later`). See `LICENSE` for the complete license text.
+
+Vendored dependencies retain their respective upstream licenses and copyright notices under `vendor/`.

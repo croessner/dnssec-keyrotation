@@ -20,6 +20,7 @@ jobs:
         ghcr.io/${{ github.repository }}:features
       labels: |
         org.opencontainers.image.description=DNSSEC key-rotation controller and CLI
+        org.opencontainers.image.licenses=AGPL-3.0-or-later
         org.opencontainers.image.revision=${{ github.sha }}
         org.opencontainers.image.source=https://github.com/${{ github.repository }}
         org.opencontainers.image.version=dev
