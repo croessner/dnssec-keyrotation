@@ -131,8 +131,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          release_args=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            if (( ${#release_args[@]} )); then
+              gh release edit "$RELEASE_TAG" "${release_args[@]}" --repo "$GITHUB_REPOSITORY"
+            fi
           else
-            gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
+            gh release create "$RELEASE_TAG" dist/* "${release_args[@]}" \
+              --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
           fi
