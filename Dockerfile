@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.9
 ARG GO_IMAGE=docker.io/library/golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2
-FROM ${GO_IMAGE} AS build
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY vendor ./vendor
@@ -10,7 +10,13 @@ ARG VERSION=dev
 ARG COMMIT=none
 ARG BUILD_DATE=unknown
 ENV CGO_ENABLED=0 GOFLAGS=-mod=vendor GOEXPERIMENT=runtimesecret
-RUN go test ./... && go build -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}" -o /out/dnssecctl ./cmd/dnssecctl
+RUN go test ./...
+ARG TARGETOS
+ARG TARGETARCH
+RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
+    go build -trimpath -buildvcs=false \
+      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}" \
+      -o /out/dnssecctl ./cmd/dnssecctl
 
 FROM scratch
 ARG VERSION=dev
