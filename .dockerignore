@@ -1,0 +1,15 @@
+.git
+.github
+.agents
+bin
+dist
+coverage.out
+*.state.json
+*.db
+*.local.yaml
+secrets.sops.env
+.sops.yaml
+.sops.yml
+.env
+deploy
+temp

@@ -1,0 +1,45 @@
+name: Security Gates
+
+on:
+  push:
+    branches: [main, features, "release/**"]
+  pull_request:
+    branches: [main, features, "release/**"]
+
+permissions:
+  contents: read
+
+env:
+  GOEXPERIMENT: runtimesecret
+  GOFLAGS: -mod=vendor
+  GOSEC_VERSION: v2.25.0
+
+jobs:
+  source-and-config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+
+      - name: Install pinned gosec
+        run: |
+          GOBIN="$(go env GOPATH)/bin" go install "github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Scan first-party Go source
+        run: make gosec
+
+      - name: Scan repository configuration
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          version: v0.72.0
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          skip-dirs: vendor,temp

@@ -1,0 +1,75 @@
+name: Reusable Release Gates
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Exact source ref to validate.
+        default: ""
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GOEXPERIMENT: runtimesecret
+  GOFLAGS: -mod=vendor
+  GOLANGCI_LINT_VERSION: v2.12.2
+  GOVULNCHECK_VERSION: v1.3.0
+  GOSEC_VERSION: v2.25.0
+
+jobs:
+  release-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+
+      - name: Install pinned Go quality tools
+        run: |
+          GOBIN="$(go env GOPATH)/bin"
+          export GOBIN
+          go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}"
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          go install "github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}"
+          echo "$GOBIN" >> "$GITHUB_PATH"
+
+      - name: Run release Go gates
+        run: make guardrails govulncheck gosec
+
+      - name: Scan repository configuration
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          version: v0.72.0
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          skip-dirs: vendor,temp
+
+      - name: Build release-equivalent image
+        run: |
+          docker build \
+            --build-arg VERSION="${GITHUB_REF_NAME#v}" \
+            --build-arg COMMIT="$GITHUB_SHA" \
+            --build-arg BUILD_DATE="$(git show -s --format=%cI "$GITHUB_SHA")" \
+            --tag dnssec-keyrotation:release-gate .
+
+      - name: Scan release-equivalent image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          version: v0.72.0
+          image-ref: dnssec-keyrotation:release-gate
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true

@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  GOEXPERIMENT: runtimesecret
+  GOFLAGS: -mod=vendor
+  SYFT_VERSION: v1.46.0
+
+jobs:
+  release-gates:
+    uses: ./.github/workflows/release-gates.yaml
+    with:
+      source_ref: ${{ github.sha }}
+
+  container:
+    needs: release-gates
+    uses: ./.github/workflows/docker-stable-build.yaml
+    with:
+      release_tag: ${{ github.ref_name }}
+      source_ref: ${{ github.sha }}
+
+  build:
+    needs: release-gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+
+      - name: Validate release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+
+      - name: Build binary
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p build
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+            go build -trimpath -buildvcs=false \
+              -ldflags "-s -w -X main.version=${RELEASE_TAG#v} -X main.commit=$GITHUB_SHA -X main.date=$(git show -s --format=%cI "$GITHUB_SHA")" \
+              -o build/dnssecctl ./cmd/dnssecctl
+
+      - name: Create release archive
+        run: |
+          asset="dnssec-keyrotation-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "dist/$asset/bin" "dist/$asset/docs" "dist/$asset/configs"
+          cp build/dnssecctl "dist/$asset/bin/"
+          cp README.md POLICY.md "dist/$asset/"
+          cp docs/spec.md "dist/$asset/docs/"
+          cp configs/config.example.yaml "dist/$asset/configs/"
+          tar -C dist -czf "dist/$asset.tar.gz" "$asset"
+
+      - name: Install pinned Syft
+        run: |
+          GOBIN="$(go env GOPATH)/bin" go install "github.com/anchore/syft/cmd/syft@${SYFT_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Generate archive SBOM
+        run: |
+          asset="dnssec-keyrotation-${{ matrix.goos }}-${{ matrix.goarch }}"
+          syft scan "dir:dist/$asset" -o "spdx-json=dist/$asset.spdx.json"
+          test -s "dist/$asset.spdx.json"
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.spdx.json
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.spdx.json
+
+  publish:
+    needs: [build, container]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz ./*.spdx.json > SHA256SUMS
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi

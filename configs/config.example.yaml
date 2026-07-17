@@ -1,0 +1,62 @@
+mode: observe
+log:
+  level: info
+controller:
+  reconcile_interval: 1m
+  propagation_margin: 2h
+  state_file: /var/lib/dnssec-keyrotation/state.json
+  socket: /run/dnssec-keyrotation/control.sock
+  idempotency_retention: 8760h
+powerdns:
+  url: http://127.0.0.1:8081/api/v1
+  server_id: localhost
+  api_key_file: /run/secrets/pdns_api_key
+  timeout: 10s
+autodns:
+  url: https://api.autodns.com/v1
+  username: api-dnssec
+  password_file: /run/secrets/autodns_password
+  context: 4
+  timeout: 20s
+  minimum_request_interval: 500ms
+dns:
+  resolvers:
+    - 1.1.1.1:53
+    - 9.9.9.9:53
+  authoritative_servers:
+    - ns1.example.net:53
+    - ns2.example.net:53
+  expected_nameservers:
+    - ns1.example.net
+    - ns2.example.net
+  local_authoritative: 127.0.0.1:53
+  timeout: 5s
+rotation:
+  algorithm: ECDSAP256SHA256
+  zsk_interval: 720h
+  ksk_interval: 4368h
+  auto_migrate_csk: false
+  minimum_dnskey_wait: 24h
+  minimum_parent_wait: 48h
+  include_zones: []
+  exclude_zones: []
+enrollment:
+  # Requires one explicit `dnssecctl enrollment arm --confirm` baseline first.
+  enabled: false
+  scope: none
+  discovery_grace: 24h
+  max_pending: 10
+  max_new_per_day: 5
+  allowed_algorithms:
+    - ECDSAP256SHA256
+  include_zones: []
+  exclude_zones: []
+notifications:
+  lmtp:
+    enabled: false
+    address: 192.0.2.50:24
+    hostname: ns1.example.net
+    from: dnssec-controller@example.net
+    to:
+      - dns-admin@example.net
+    timeout: 10s

@@ -1,0 +1,244 @@
+openapi: 3.1.0
+info:
+  title: DNSSEC Key Rotation Control API
+  version: 1.1.0
+  description: Local, Unix-socket-only control plane. Responses never contain private key material.
+servers:
+  - url: http://unix
+paths:
+  /healthz:
+    get:
+      operationId: health
+      responses:
+        '200': {description: Process is alive}
+  /readyz:
+    get:
+      operationId: ready
+      responses:
+        '200': {description: Controller dependencies are ready}
+        '503': {description: A required dependency is unavailable}
+  /v1/status:
+    get:
+      operationId: getStatus
+      responses:
+        '200':
+          description: Aggregate controller status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Status'}
+  /v1/zones:
+    get:
+      operationId: listZones
+      responses:
+        '200':
+          description: DNSSEC zones and workflow state
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/ZoneStatus'}
+  /v1/audit:
+    get:
+      operationId: auditRegistrarMaterial
+      responses:
+        '200':
+          description: Read-only comparison of active local KSK or CSK against InternetX material
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [zone, scheme, registrarMatch]
+                  properties:
+                    zone: {type: string}
+                    scheme: {type: string}
+                    registrarMatch: {type: boolean}
+                    error: {type: string}
+  /v1/rotations/plan:
+    post:
+      operationId: planRotation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RotationRequest'}
+      responses:
+        '200':
+          description: Read-only plan
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Plan'}
+  /v1/rotations/trigger:
+    post:
+      operationId: triggerRotation
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, minLength: 16, maxLength: 128}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TriggerRequest'}
+      responses:
+        '202': {description: Trigger persisted}
+        '409': {description: Conflicting workflow or idempotency key}
+  /v1/rotations/resume:
+    post:
+      operationId: resumeBlockedSplitRotation
+      description: Revalidate live PowerDNS, registrar, and parent-DS invariants before atomically resuming blocked split workflows at wait_publish. This operation performs no PowerDNS or registrar write.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, minLength: 16, maxLength: 128}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ResumeRequest'}
+      responses:
+        '202': {description: Recovery transition persisted}
+        '409': {description: Live invariant, workflow state, or idempotency conflict}
+  /v1/enrollment/arm:
+    post:
+      operationId: armAutomaticEnrollment
+      description: Persist a one-time baseline of all current DNSSEC zones. This state-only operation performs no PowerDNS, registrar, or DNS mutation.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, minLength: 16, maxLength: 128}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ArmEnrollmentRequest'}
+      responses:
+        '202': {description: Enrollment baseline persisted and armed}
+        '409': {description: Enrollment disabled, already armed, or idempotency conflict}
+components:
+  schemas:
+    Status:
+      type: object
+      additionalProperties: false
+      required: [mode, ready, zones, blocked, enrollmentArmed, enrolling, managed, pendingNotifications]
+      properties:
+        mode: {type: string, enum: [observe, enforce]}
+        ready: {type: boolean}
+        zones: {type: integer, minimum: 0}
+        blocked: {type: integer, minimum: 0}
+        enrollmentArmed: {type: boolean}
+        enrolling: {type: integer, minimum: 0}
+        managed: {type: integer, minimum: 0}
+        pendingNotifications: {type: integer, minimum: 0}
+    ZoneStatus:
+      type: object
+      additionalProperties: false
+      required: [zone, dnssec, scheme, managed, enrollmentStatus, workflows]
+      properties:
+        zone: {type: string}
+        dnssec: {type: boolean}
+        scheme: {type: string, enum: [split, csk, unknown]}
+        managed: {type: boolean}
+        enrollmentStatus: {type: string, enum: [disarmed, managed, baseline, enrolled, ineligible, candidate, waiting, registrar_pending, parent_wait, blocked]}
+        blockedReason: {type: string}
+        workflows:
+          type: array
+          items:
+            $ref: '#/components/schemas/Workflow'
+    Workflow:
+      type: object
+      additionalProperties: false
+      required: [zone, kind, phase]
+      properties:
+        zone: {type: string}
+        kind: {type: string, enum: [zsk, ksk, split, enroll]}
+        phase:
+          type: string
+          enum: [idle, prepublish, wait_publish, activate_new, wait_new_signature, deactivate_old, parent_remove, wait_parent_remove, wait_retire, delete_old, enroll_discovered, enroll_wait_publish, enroll_parent_add, enroll_wait_parent, blocked]
+        zoneId: {type: string}
+        oldKeyId: {type: integer}
+        newKeyId: {type: integer}
+        newZskId: {type: integer}
+        newKeyCreateAttemptedAt: {type: string, format: date-time}
+        newZskCreateAttemptedAt: {type: string, format: date-time}
+        phaseStartedAt: {type: string, format: date-time}
+        nextActionAt: {type: string, format: date-time}
+        lastCompletedAt: {type: string, format: date-time}
+        dnskeyTtlSeconds: {type: integer, minimum: 0}
+        zoneTtlSeconds: {type: integer, minimum: 0}
+        parentDsTtlSeconds: {type: integer, minimum: 0}
+        evidenceAt: {type: string, format: date-time}
+        registrarCtid: {type: string}
+        registrarStid: {type: string}
+        registrarJobId: {type: integer, minimum: 1}
+        registrarJobStatus: {type: string}
+        registrarAttemptedAt: {type: string, format: date-time}
+        registrarPayloadHash: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        parentMode: {type: string, enum: [existing, initial]}
+        discoveredAt: {type: string, format: date-time}
+        keysetFingerprint: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        enrollmentDisposition: {type: string, enum: [baseline, candidate, enrolled, ineligible]}
+        attempts: {type: integer, minimum: 0}
+        lastError: {type: string}
+        manual: {type: boolean}
+        idempotencyKey: {type: string}
+    RotationRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, zones]
+      properties:
+        kind: {type: string, enum: [zsk, ksk, split]}
+        zones:
+          type: array
+          minItems: 1
+          items: {type: string}
+    TriggerRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, zones, confirm]
+      properties:
+        kind: {type: string, enum: [zsk, ksk, split]}
+        zones:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items: {type: string}
+        confirm: {type: boolean, const: true}
+    ResumeRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, zones, phase, confirm]
+      properties:
+        kind: {type: string, const: split}
+        zones:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items: {type: string}
+        phase: {type: string, const: wait_publish}
+        confirm: {type: boolean, const: true}
+    ArmEnrollmentRequest:
+      type: object
+      additionalProperties: false
+      required: [confirm]
+      properties:
+        confirm: {type: boolean, const: true}
+    Plan:
+      type: object
+      additionalProperties: false
+      required: [kind, zones, mutations]
+      properties:
+        kind: {type: string}
+        zones:
+          type: array
+          items: {type: string}
+        mutations:
+          type: array
+          items: {type: string}

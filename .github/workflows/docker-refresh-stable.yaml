@@ -1,0 +1,98 @@
+name: Stable Container Refresh
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      base_image: ${{ steps.compare.outputs.base_image }}
+      rebuild_suffix: ${{ steps.compare.outputs.rebuild_suffix }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_rebuild: ${{ steps.compare.outputs.should_rebuild }}
+    steps:
+      - name: Check out workflow tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Determine latest stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_tag="$(gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --exclude-drafts \
+            --exclude-pre-releases \
+            --limit 1 \
+            --json tagName \
+            --jq '.[0].tagName')"
+          if [[ -z "$release_tag" || "$release_tag" == "null" ]]; then
+            echo "No published stable release found" >&2
+            exit 1
+          fi
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Compare builder digest with published image
+        id: compare
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          base_name="$(sed -n 's/^ARG GO_IMAGE=//p' Dockerfile | head -n 1)"
+          base_name="${base_name%@*}"
+          base_digest="$(docker buildx imagetools inspect "$base_name" | awk '$1 == "Digest:" { print $2; exit }')"
+          if [[ ! "$base_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve builder image digest" >&2
+            exit 1
+          fi
+          docker pull "${IMAGE}:${RELEASE_TAG}" >/dev/null
+          published_digest="$(docker image inspect \
+            --format '{{ index .Config.Labels "io.dnssec-keyrotation.base.golang.digest" }}' \
+            "${IMAGE}:${RELEASE_TAG}")"
+          should_rebuild=false
+          if [[ "$published_digest" != "$base_digest" ]]; then
+            should_rebuild=true
+          fi
+          {
+            echo "base_image=${base_name}@${base_digest}"
+            echo "rebuild_suffix=rebuild-$(date -u +%Y%m%d)"
+            echo "should_rebuild=$should_rebuild"
+          } >> "$GITHUB_OUTPUT"
+
+  release-gates:
+    needs: detect
+    if: needs.detect.outputs.should_rebuild == 'true'
+    uses: ./.github/workflows/release-gates.yaml
+    with:
+      source_ref: ${{ needs.detect.outputs.release_tag }}
+
+  rebuild:
+    needs: [detect, release-gates]
+    if: needs.detect.outputs.should_rebuild == 'true'
+    uses: ./.github/workflows/docker-stable-build.yaml
+    with:
+      base_image: ${{ needs.detect.outputs.base_image }}
+      build_reason: scheduled-base-refresh
+      rebuild_suffix: ${{ needs.detect.outputs.rebuild_suffix }}
+      release_tag: ${{ needs.detect.outputs.release_tag }}
+      source_ref: ${{ needs.detect.outputs.release_tag }}

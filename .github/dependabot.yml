@@ -1,0 +1,27 @@
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: features
+    vendor: true
+    commit-message:
+      prefix: "Vendor:"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: features
+    commit-message:
+      prefix: "CI:"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: features
+    commit-message:
+      prefix: "Build:"

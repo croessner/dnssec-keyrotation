@@ -1,0 +1,35 @@
+name: Container Check
+
+on:
+  push:
+    branches: [main, features, "release/**"]
+  pull_request:
+    branches: [main, features, "release/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build release-equivalent image
+        run: |
+          docker build \
+            --build-arg VERSION=ci \
+            --build-arg COMMIT="$GITHUB_SHA" \
+            --build-arg BUILD_DATE="$(git show -s --format=%cI "$GITHUB_SHA")" \
+            --tag dnssec-keyrotation:ci .
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          version: v0.72.0
+          image-ref: dnssec-keyrotation:ci
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true

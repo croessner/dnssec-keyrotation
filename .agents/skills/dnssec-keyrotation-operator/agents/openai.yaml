@@ -1,0 +1,4 @@
+interface:
+  display_name: "DNSSEC Rotation Operator"
+  short_description: "Safely operate DNSSEC key rollovers"
+  default_prompt: "Use $dnssec-keyrotation-operator to audit or operate the DNSSEC rotation controller safely."

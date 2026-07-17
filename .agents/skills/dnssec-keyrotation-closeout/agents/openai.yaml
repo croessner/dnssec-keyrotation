@@ -1,0 +1,4 @@
+interface:
+  display_name: "DNSSEC Change Closeout"
+  short_description: "Verify and hand off production-critical changes"
+  default_prompt: "Use $dnssec-keyrotation-closeout to validate and close out this repository change."

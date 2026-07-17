@@ -1,0 +1,4 @@
+interface:
+  display_name: "DNSSEC Configuration Safety"
+  short_description: "Keep configuration public and secret-safe"
+  default_prompt: "Use $dnssec-keyrotation-config-security to review or change configuration safely."

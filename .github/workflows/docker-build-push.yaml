@@ -1,0 +1,76 @@
+name: Reusable Container Build
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Git ref to build.
+        required: true
+        type: string
+      tags:
+        description: Newline-separated image tags.
+        required: true
+        type: string
+      labels:
+        description: Newline-separated OCI labels.
+        required: true
+        type: string
+      build_args:
+        description: Newline-separated Docker build arguments.
+        required: true
+        type: string
+      sbom:
+        description: Generate an image SBOM.
+        default: true
+        required: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@e25151c35cf18a4dcbcf08592d9f0f06c1e6ac87 # v3.6.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Build and push multi-architecture image
+        id: build
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v6.18.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: ${{ inputs.sbom }}
+          provenance: mode=max
+          tags: ${{ inputs.tags }}
+          labels: ${{ inputs.labels }}
+          build-args: ${{ inputs.build_args }}
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

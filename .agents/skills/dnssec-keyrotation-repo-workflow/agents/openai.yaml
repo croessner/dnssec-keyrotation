@@ -1,0 +1,4 @@
+interface:
+  display_name: "DNSSEC Repository Workflow"
+  short_description: "Apply repository-wide Go and branch gates"
+  default_prompt: "Use $dnssec-keyrotation-repo-workflow to make and validate a repository change."

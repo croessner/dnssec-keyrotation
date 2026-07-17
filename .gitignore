@@ -1,0 +1,15 @@
+/bin/
+/dist/
+/coverage.out
+/.env
+/secrets.sops.env
+/deploy/
+/temp/
+/.sops.yaml
+/.sops.yml
+/.idea/
+/.vscode/
+.DS_Store
+*.local.yaml
+*.db
+*.state.json

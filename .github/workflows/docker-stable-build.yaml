@@ -1,0 +1,119 @@
+name: Reusable Stable Container Build
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Semantic release tag to build.
+        required: true
+        type: string
+      source_ref:
+        description: Exact release source ref.
+        required: true
+        type: string
+      base_image:
+        description: Optional immutable Go builder image override.
+        default: ""
+        required: false
+        type: string
+      rebuild_suffix:
+        description: Optional audit tag for a scheduled rebuild.
+        default: ""
+        required: false
+        type: string
+      build_reason:
+        description: Reason recorded in OCI labels.
+        default: tag-push
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      build_args: ${{ steps.release.outputs.build_args }}
+      labels: ${{ steps.release.outputs.labels }}
+      tags: ${{ steps.release.outputs.tags }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref }}
+
+      - name: Validate and derive release metadata
+        id: release
+        shell: bash
+        env:
+          BASE_IMAGE_OVERRIDE: ${{ inputs.base_image }}
+          BUILD_REASON: ${{ inputs.build_reason }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          REBUILD_SUFFIX: ${{ inputs.rebuild_suffix }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid semantic version tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          version="${RELEASE_TAG#v}"
+          build_date="$(git show -s --format=%cI "$GITHUB_SHA")"
+          base_image="$BASE_IMAGE_OVERRIDE"
+          if [[ -z "$base_image" ]]; then
+            base_image="$(sed -n 's/^ARG GO_IMAGE=//p' Dockerfile | head -n 1)"
+          fi
+          if [[ "$base_image" != *@sha256:* ]]; then
+            echo "Builder image must include an immutable sha256 digest" >&2
+            exit 1
+          fi
+          base_digest="${base_image##*@}"
+          base_name="${base_image%@*}"
+
+          tags="${IMAGE}:${version}"
+          if [[ "$version" != *-* ]]; then
+            tags+=$'\n'"${IMAGE}:${major}.${minor}"
+            tags+=$'\n'"${IMAGE}:${major}"
+            tags+=$'\n'"${IMAGE}:latest"
+          fi
+          if [[ -n "$REBUILD_SUFFIX" ]]; then
+            tags+=$'\n'"${IMAGE}:${version}-${REBUILD_SUFFIX}"
+          fi
+
+          {
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+            echo "build_args<<EOF"
+            echo "GO_IMAGE=$base_image"
+            echo "VERSION=$version"
+            echo "COMMIT=$GITHUB_SHA"
+            echo "BUILD_DATE=$build_date"
+            echo "EOF"
+            echo "labels<<EOF"
+            echo "org.opencontainers.image.description=DNSSEC key-rotation controller and CLI"
+            echo "org.opencontainers.image.revision=$GITHUB_SHA"
+            echo "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY"
+            echo "org.opencontainers.image.version=$version"
+            echo "io.dnssec-keyrotation.base.golang.digest=$base_digest"
+            echo "io.dnssec-keyrotation.base.golang.image=$base_name"
+            echo "io.dnssec-keyrotation.build.reason=$BUILD_REASON"
+            echo "io.dnssec-keyrotation.release.tag=$RELEASE_TAG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: metadata
+    uses: ./.github/workflows/docker-build-push.yaml
+    with:
+      source_ref: ${{ inputs.source_ref }}
+      tags: ${{ needs.metadata.outputs.tags }}
+      labels: ${{ needs.metadata.outputs.labels }}
+      build_args: ${{ needs.metadata.outputs.build_args }}
+      sbom: true

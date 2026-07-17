@@ -1,0 +1,4 @@
+interface:
+  display_name: "DNSSEC OpenAPI and CLI"
+  short_description: "Keep control API, schema, and CLI aligned"
+  default_prompt: "Use $dnssec-keyrotation-openapi-cli to change the control API or CLI consistently."
