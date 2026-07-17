@@ -42,7 +42,7 @@ jobs:
           ref: ${{ inputs.source_ref }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@e25151c35cf18a4dcbcf08592d9f0f06c1e6ac87 # v3.6.0
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v3.11.1

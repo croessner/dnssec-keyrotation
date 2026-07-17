@@ -77,7 +77,8 @@ jobs:
 
       - name: Install pinned Syft
         run: |
-          GOBIN="$(go env GOPATH)/bin" go install "github.com/anchore/syft/cmd/syft@${SYFT_VERSION}"
+          GOFLAGS=-mod=mod GOBIN="$(go env GOPATH)/bin" \
+            go install "github.com/anchore/syft/cmd/syft@${SYFT_VERSION}"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Generate archive SBOM
