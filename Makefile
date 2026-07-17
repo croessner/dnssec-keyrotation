@@ -40,16 +40,16 @@ lint:
 
 openapi-check:
 	@test -s api/openapi.yaml
-	@rg -q '^openapi: 3\.1\.0$$' api/openapi.yaml
-	@rg -q '^  /v1/rotations/trigger:' api/openapi.yaml
-	@rg -q '^  /v1/rotations/resume:' api/openapi.yaml
-	@rg -q '^  /v1/enrollment/arm:' api/openapi.yaml
+	@grep -Eq '^openapi: 3\.1\.0$$' api/openapi.yaml
+	@grep -Eq '^  /v1/rotations/trigger:' api/openapi.yaml
+	@grep -Eq '^  /v1/rotations/resume:' api/openapi.yaml
+	@grep -Eq '^  /v1/enrollment/arm:' api/openapi.yaml
 
 license-check:
 	@test -s LICENSE
-	@rg -q '^ +GNU AFFERO GENERAL PUBLIC LICENSE$$' LICENSE
-	@rg -q 'AGPL-3\.0-or-later' README.md Dockerfile
-	@rg -q 'cp LICENSE README\.md POLICY\.md' .github/workflows/release.yaml
+	@grep -Eq '^ +GNU AFFERO GENERAL PUBLIC LICENSE$$' LICENSE
+	@grep -Eq 'AGPL-3\.0-or-later' README.md Dockerfile
+	@grep -Eq 'cp LICENSE README\.md POLICY\.md' .github/workflows/release.yaml
 
 check: fmt-check test vet openapi-check
 
