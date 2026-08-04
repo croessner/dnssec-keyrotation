@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,10 @@ import (
 
 	"github.com/croessner/dnssec-keyrotation/internal/model"
 )
+
+// ErrJobUnavailable identifies a registrar job that can no longer be queried.
+// Callers must reconcile the intended public registrar state before proceeding.
+var ErrJobUnavailable = errors.New("autodns job is no longer available")
 
 // API defines the registrar operations used by the controller.
 type API interface {
@@ -56,6 +61,18 @@ type response struct {
 		Type       string `json:"type"`
 	} `json:"status"`
 	Data []json.RawMessage `json:"data"`
+}
+
+type requestError struct {
+	method  string
+	path    string
+	status  int
+	code    string
+	message string
+}
+
+func (e *requestError) Error() string {
+	return fmt.Sprintf("autodns %s %s: status %d code %s: %s", e.method, e.path, e.status, e.code, e.message)
 }
 
 // New creates a registrar API client.
@@ -148,6 +165,10 @@ func (c *Client) JobStatus(ctx context.Context, id int64) (string, error) {
 	}
 	var r response
 	if err := c.do(ctx, http.MethodGet, "/job/"+fmt.Sprint(id), nil, "", &r); err != nil {
+		var requestErr *requestError
+		if errors.As(err, &requestErr) && requestErr.status == http.StatusNotFound && requestErr.code == "E300114" {
+			return "", fmt.Errorf("%w: %w", ErrJobUnavailable, err)
+		}
 		return "", err
 	}
 	if len(r.Data) != 1 {
@@ -222,7 +243,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, ctid str
 		if code == "" {
 			code = e.Status.ResultCode
 		}
-		return fmt.Errorf("autodns %s %s: status %d code %s: %s", method, path, resp.StatusCode, code, msg)
+		return &requestError{method: method, path: path, status: resp.StatusCode, code: code, message: msg}
 	}
 	if err := json.NewDecoder(limited).Decode(out); err != nil {
 		return fmt.Errorf("decode autodns response: %w", err)

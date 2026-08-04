@@ -32,6 +32,8 @@ type fakeRegistrar struct {
 	updates   int
 	state     autodns.DomainDNSSECState
 	updateErr error
+	jobErr    error
+	jobStatus string
 }
 
 func (f *fakeRegistrar) DomainDNSSEC(context.Context, string) (autodns.DomainDNSSECState, error) {
@@ -44,7 +46,15 @@ func (f *fakeRegistrar) UpdateDNSSEC(context.Context, string, []model.DNSSECData
 	}
 	return autodns.Job{ID: 42, STID: "tx", Status: "RUNNING"}, nil
 }
-func (*fakeRegistrar) JobStatus(context.Context, int64) (string, error) { return "SUCCESS", nil }
+func (f *fakeRegistrar) JobStatus(context.Context, int64) (string, error) {
+	if f.jobErr != nil {
+		return "", f.jobErr
+	}
+	if f.jobStatus != "" {
+		return f.jobStatus, nil
+	}
+	return "SUCCESS", nil
+}
 
 type refusingObserver struct{ signatureChecks int }
 
@@ -1112,6 +1122,54 @@ func TestParentWaitPersistsAuthoritativeDSTTL(t *testing.T) {
 	}
 	if !got.NextActionAt.Equal(c.clock.Now().Add(74 * time.Hour)) {
 		t.Fatalf("next=%s", got.NextActionAt)
+	}
+}
+
+func TestParentWaitReconcilesUnavailableRegistrarJobWithExactMaterial(t *testing.T) {
+	p := &recordingPDNS{}
+	c, s := newTestController(t, p, &evidenceObserver{})
+	c.registrar = &fakeRegistrar{
+		state: autodns.DomainDNSSECState{
+			Enabled: true,
+			Data:    []model.DNSSECData{{Flags: 257, Protocol: 3, Algorithm: 13, PublicKey: "BAUG"}},
+		},
+		jobErr: autodns.ErrJobUnavailable,
+	}
+	w := model.Workflow{Zone: "example.test.", Kind: model.KindKSK, Phase: model.PhaseWaitParentRemove, OldKeyID: 1, NewKeyID: 2, RegistrarJobID: 42, RegistrarJobStatus: "RUNNING"}
+	if err := s.Update(func(st *model.State) error { st.Workflows[model.WorkflowKey(w.Zone, w.Kind)] = w; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	keys := []model.Key{{ID: 1, KeyType: "ksk", Active: true, Published: true, DNSKEY: "257 3 13 AQID"}, {ID: 2, KeyType: "ksk", Active: true, Published: true, DNSKEY: "257 3 13 BAUG"}}
+	if err := c.waitParentReplace(context.Background(), model.Zone{Name: w.Zone}, keys, w); err != nil {
+		t.Fatal(err)
+	}
+	got := s.Snapshot().Workflows[model.WorkflowKey(w.Zone, w.Kind)]
+	if got.RegistrarJobStatus != "SUCCESS" {
+		t.Fatalf("registrar status=%q", got.RegistrarJobStatus)
+	}
+	if !got.EvidenceAt.IsZero() {
+		t.Fatalf("parent evidence advanced before the next reconciliation: %s", got.EvidenceAt)
+	}
+}
+
+func TestParentWaitRejectsUnavailableRegistrarJobWithMismatchedMaterial(t *testing.T) {
+	p := &recordingPDNS{}
+	c, s := newTestController(t, p, &evidenceObserver{})
+	c.registrar = &fakeRegistrar{
+		state:  autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{{Flags: 257, Protocol: 3, Algorithm: 13, PublicKey: "AQID"}}},
+		jobErr: autodns.ErrJobUnavailable,
+	}
+	w := model.Workflow{Zone: "example.test.", Kind: model.KindKSK, Phase: model.PhaseWaitParentRemove, OldKeyID: 1, NewKeyID: 2, RegistrarJobID: 42, RegistrarJobStatus: "RUNNING"}
+	if err := s.Update(func(st *model.State) error { st.Workflows[model.WorkflowKey(w.Zone, w.Kind)] = w; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	keys := []model.Key{{ID: 1, KeyType: "ksk", Active: true, Published: true, DNSKEY: "257 3 13 AQID"}, {ID: 2, KeyType: "ksk", Active: true, Published: true, DNSKEY: "257 3 13 BAUG"}}
+	if err := c.waitParentReplace(context.Background(), model.Zone{Name: w.Zone}, keys, w); err == nil {
+		t.Fatal("expected mismatched registrar material to remain fail-closed")
+	}
+	got := s.Snapshot().Workflows[model.WorkflowKey(w.Zone, w.Kind)]
+	if got.RegistrarJobStatus != "RUNNING" {
+		t.Fatalf("registrar status=%q", got.RegistrarJobStatus)
 	}
 }
 

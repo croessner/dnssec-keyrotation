@@ -70,7 +70,7 @@ State is stored as an atomically replaced JSON document with mode `0600`. One pr
 
 ## Failure model
 
-- Read failures retry and do not mutate.
+- Read failures retry and do not mutate. If an asynchronous InternetX job is no longer queryable, the controller may only record it as successful after a fresh direct registrar read proves the exact recorded replacement public material; it must then complete the ordinary authoritative and recursive DS/DNSKEY evidence gates before any local key transition.
 - Ambiguous write results are reconciled by reading PowerDNS/InternetX/public DNS before retrying.
 - Invariant violations block only the affected zone and are visible in status and metrics.
 - The process is ready only when configuration, state storage, PowerDNS API, and control socket are available.

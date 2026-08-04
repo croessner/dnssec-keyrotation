@@ -871,7 +871,10 @@ func (c *Controller) enrollWaitParent(ctx context.Context, zone model.Zone, keys
 	if w.RegistrarJobID > 0 && !jobSucceeded(w.RegistrarJobStatus) {
 		status, err := c.registrar.JobStatus(ctx, w.RegistrarJobID)
 		if err != nil {
-			return err
+			if err := c.reconcileUnavailableRegistrarJob(ctx, zone.Name, ksk, err); err != nil {
+				return err
+			}
+			return c.transition(w, model.PhaseEnrollWaitParent, c.clock.Now(), func(x *model.Workflow) { x.RegistrarJobStatus = "SUCCESS" })
 		}
 		if jobFailed(status) {
 			return c.block(zone.Name, w.Kind, fmt.Sprintf("InternetX enrollment job %d finished with %s", w.RegistrarJobID, status))
@@ -1036,7 +1039,10 @@ func (c *Controller) waitParentReplace(ctx context.Context, zone model.Zone, key
 	if w.RegistrarJobID > 0 && !jobSucceeded(w.RegistrarJobStatus) {
 		status, err := c.registrar.JobStatus(ctx, w.RegistrarJobID)
 		if err != nil {
-			return err
+			if err := c.reconcileUnavailableRegistrarJob(ctx, zone.Name, newKey, err); err != nil {
+				return err
+			}
+			return c.transition(w, model.PhaseWaitParentRemove, c.clock.Now(), func(x *model.Workflow) { x.RegistrarJobStatus = "SUCCESS" })
 		}
 		if jobFailed(status) {
 			return c.block(zone.Name, w.Kind, fmt.Sprintf("InternetX job %d finished with %s", w.RegistrarJobID, status))
@@ -1071,6 +1077,24 @@ func (c *Controller) waitParentReplace(ctx context.Context, zone model.Zone, key
 		next = model.PhaseActivateNew
 	}
 	return c.transition(w, next, c.clock.Now(), func(x *model.Workflow) { x.EvidenceAt = time.Time{} })
+}
+
+func (c *Controller) reconcileUnavailableRegistrarJob(ctx context.Context, zone string, key model.Key, jobErr error) error {
+	if !errors.Is(jobErr, autodns.ErrJobUnavailable) {
+		return jobErr
+	}
+	expected, err := dnsprobe.DNSSECDataForKey(zone, key)
+	if err != nil {
+		return err
+	}
+	remote, err := c.registrar.DomainDNSSEC(ctx, zone)
+	if err != nil {
+		return err
+	}
+	if !remote.Enabled || !sameMaterial(remote.Data, []model.DNSSECData{expected}) {
+		return errors.New("InternetX job is unavailable and current registrar material does not exactly match the recorded replacement key")
+	}
+	return nil
 }
 
 func (c *Controller) waitRetire(ctx context.Context, zone model.Zone, keys []model.Key, w model.Workflow) error {

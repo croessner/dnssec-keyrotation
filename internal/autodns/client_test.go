@@ -3,6 +3,7 @@ package autodns
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -68,6 +69,18 @@ func TestJobStatusUsesOfficialNestedJobShape(t *testing.T) {
 	}
 	if got != "SUCCESS" {
 		t.Fatalf("status=%q", got)
+	}
+}
+
+func TestJobStatusClassifiesExpiredWorkflowJob(t *testing.T) {
+	hc := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		fixture := `{"status":{"code":"E300114","type":"ERROR","text":"The workflow job could not be inquired."}}`
+		return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(fixture)), Header: make(http.Header)}, nil
+	})}
+	c := New("https://api.test/v1", "user", "secret", 4, 0, hc)
+	_, err := c.JobStatus(context.Background(), 71378422)
+	if !errors.Is(err, ErrJobUnavailable) {
+		t.Fatalf("expected unavailable job error, got %v", err)
 	}
 }
 
