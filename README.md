@@ -171,7 +171,7 @@ A baselined, completed, ineligible, drifted, removed, or DNSSEC-disabled zone is
 - A writable state directory under `/var/lib/dnssec-keyrotation`.
 - A writable runtime directory under `/run/dnssec-keyrotation`.
 - Two mode-`0600` secret files under `/run/secrets`.
-- Go 1.26.5 when building from source.
+- Go 1.26.6 when building from source.
 - Optional: a private or loopback LMTP endpoint for completion reports.
 
 The controller intentionally rejects remote plaintext PowerDNS API URLs, unapproved registrar API hosts, insufficient DNS evidence paths, weak propagation limits, and permissive secret-file modes.
