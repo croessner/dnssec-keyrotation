@@ -105,6 +105,7 @@ type Workflow struct {
 	RegistrarAttemptedAt    time.Time `json:"registrarAttemptedAt,omitempty"`
 	RegistrarPayloadHash    string    `json:"registrarPayloadHash,omitempty"`
 	ParentMode              string    `json:"parentMode,omitempty"`
+	SplitSignerTransitionAt time.Time `json:"splitSignerTransitionAt,omitempty"`
 	DiscoveredAt            time.Time `json:"discoveredAt,omitempty"`
 	KeysetFingerprint       string    `json:"keysetFingerprint,omitempty"`
 	EnrollmentDisposition   string    `json:"enrollmentDisposition,omitempty"`

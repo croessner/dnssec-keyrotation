@@ -87,3 +87,9 @@ type ResumeRequest struct {
 	Phase   model.Phase `json:"phase"`
 	Confirm bool        `json:"confirm"`
 }
+
+// SplitSignerTransitionRequest confirms one exact state-only reconciliation.
+type SplitSignerTransitionRequest struct {
+	Zone    string `json:"zone"`
+	Confirm bool   `json:"confirm"`
+}

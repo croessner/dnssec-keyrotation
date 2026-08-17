@@ -40,6 +40,7 @@ func New(c *controller.Controller, path string, log *slog.Logger) *Server {
 	mux.HandleFunc("POST /v1/rotations/plan", s.plan)
 	mux.HandleFunc("POST /v1/rotations/trigger", s.trigger)
 	mux.HandleFunc("POST /v1/rotations/resume", s.resume)
+	mux.HandleFunc("POST /v1/rotations/reconcile-split-signer", s.reconcileSplitSigner)
 	mux.HandleFunc("POST /v1/enrollment/arm", s.armEnrollment)
 	s.http = &http.Server{Handler: securityHeaders(mux), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	return s
@@ -236,6 +237,31 @@ func (s *Server) resume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+func (s *Server) reconcileSplitSigner(w http.ResponseWriter, r *http.Request) {
+	defer func() { _ = r.Body.Close() }()
+	d := json.NewDecoder(io.LimitReader(r.Body, 16<<10))
+	d.DisallowUnknownFields()
+	var req SplitSignerTransitionRequest
+	if err := d.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(req.Zone) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("one zone is required"))
+		return
+	}
+	if !req.Confirm {
+		writeError(w, http.StatusBadRequest, errors.New("confirm must be true"))
+		return
+	}
+	idem := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if err := s.controller.ReconcileSplitSignerTransition(r.Context(), req.Zone, idem); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "attested"})
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

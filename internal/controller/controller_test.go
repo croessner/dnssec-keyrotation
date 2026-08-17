@@ -640,6 +640,46 @@ func (o *evidenceObserver) DelegationEvidence(context.Context, string, []string)
 	return o.delegationErr
 }
 
+type splitSignerTransitionObserver struct {
+	evidenceObserver
+	oldKeyID     int
+	dnskeyErr    error
+	dsErr        error
+	authDSErr    error
+	dnskeySigErr error
+	zskSigErr    error
+}
+
+func (o *splitSignerTransitionObserver) DNSKEYEvidence(context.Context, string, ...model.Key) (time.Duration, error) {
+	return o.dnskeyTTL, o.dnskeyErr
+}
+
+func (o *splitSignerTransitionObserver) DSEvidence(context.Context, string, []model.Key) error {
+	return o.dsErr
+}
+
+func (o *splitSignerTransitionObserver) AuthoritativeDSEvidence(context.Context, string, []model.Key) (time.Duration, error) {
+	return o.parentTTL, o.authDSErr
+}
+
+func (o *splitSignerTransitionObserver) DNSKEYRRSIGBy(context.Context, string, model.Key) error {
+	return o.dnskeySigErr
+}
+
+func (o *splitSignerTransitionObserver) RRSIGBy(_ context.Context, _ string, key model.Key) error {
+	if key.ID == o.oldKeyID {
+		return errors.New("old CSK no longer signs zone data after PowerDNS role transition")
+	}
+	return o.zskSigErr
+}
+
+func (o *splitSignerTransitionObserver) AuthoritativeRRSIGBy(_ context.Context, _ string, key model.Key) error {
+	if key.ID == o.oldKeyID {
+		return errors.New("old CSK no longer signs authoritative zone data after PowerDNS role transition")
+	}
+	return nil
+}
+
 type recordingNotifier struct {
 	events []model.Notification
 	err    error
@@ -1290,6 +1330,358 @@ func TestResumeRejectsZoneOutsideConfiguredScope(t *testing.T) {
 	}
 	if got := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)].Phase; got != model.PhaseBlocked {
 		t.Fatalf("phase=%s", got)
+	}
+}
+
+func TestReconcileSplitSignerTransitionAttestsExactLiveStateWithoutExternalMutation(t *testing.T) {
+	zone := "example.test."
+	keys := []model.Key{
+		{ID: 1, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 AQID"},
+		{ID: 2, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 BAUG"},
+		{ID: 3, KeyType: "zsk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "256 3 13 BwgJ"},
+	}
+	newKSK, err := dnsprobe.DNSSECDataForKey(zone, keys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &recordingPDNS{
+		zones:   []model.Zone{{ID: zone, Name: zone, DNSSEC: true}},
+		keys:    map[string][]model.Key{zone: keys},
+		zoneTTL: uint32((48 * time.Hour) / time.Second),
+	}
+	reg := &fakeRegistrar{state: autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{newKSK}}}
+	obs := &splitSignerTransitionObserver{oldKeyID: 1}
+	c, st := newTestController(t, p, obs)
+	c.registrar = reg
+	w := model.Workflow{
+		Zone: zone, Kind: model.KindSplit, Phase: model.PhaseWaitNewSignature,
+		OldKeyID: 1, NewKeyID: 2, NewZSKID: 3, ParentMode: parentModeInitial,
+		RegistrarAttemptedAt: c.clock.Now().Add(-72 * time.Hour), RegistrarCTID: "dnssec-split-test",
+		LastError: "old CSK overlap signature missing",
+	}
+	if err := st.Update(func(s *model.State) error {
+		s.Workflows[model.WorkflowKey(zone, model.KindSplit)] = w
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.ReconcileSplitSignerTransition(context.Background(), zone, "split-signer-test-0001"); err != nil {
+		t.Fatal(err)
+	}
+	got := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+	if got.SplitSignerTransitionAt.IsZero() || got.ZoneTTL != int64(48*time.Hour/time.Second) || got.LastError != "" {
+		t.Fatalf("workflow=%+v", got)
+	}
+	wantNext := c.clock.Now().Add(50 * time.Hour)
+	if !got.NextActionAt.Equal(wantNext) {
+		t.Fatalf("nextActionAt=%s want=%s", got.NextActionAt, wantNext)
+	}
+	if p.creates != 0 || p.setCalls != 0 || p.deletes != 0 || reg.updates != 0 {
+		t.Fatalf("reconciliation mutated external state: pdns=%d/%d/%d registrar=%d", p.creates, p.setCalls, p.deletes, reg.updates)
+	}
+	if err := c.ReconcileSplitSignerTransition(context.Background(), zone, "split-signer-test-0001"); err != nil {
+		t.Fatalf("idempotent replay failed: %v", err)
+	}
+	if err := c.ReconcileSplitSignerTransition(context.Background(), zone, "split-signer-test-0001-different"); err == nil {
+		t.Fatal("a different idempotency key reset an existing attestation")
+	}
+
+	c.clock = fixedClock{got.NextActionAt}
+	if err := c.waitNewSignature(context.Background(), model.Zone{ID: zone, Name: zone}, keys, got); err != nil {
+		t.Fatal(err)
+	}
+	afterWait := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+	if afterWait.Phase != model.PhaseDeactivateOld {
+		t.Fatalf("phase=%s", afterWait.Phase)
+	}
+	if p.setCalls != 0 {
+		t.Fatal("wait phase mutated PowerDNS")
+	}
+	if err := c.deactivateOld(context.Background(), model.Zone{ID: zone, Name: zone}, keys, afterWait); err != nil {
+		t.Fatal(err)
+	}
+	if p.setCalls != 1 || p.deletes != 0 || reg.updates != 0 {
+		t.Fatalf("unexpected external mutations after guarded deactivation: set=%d delete=%d registrar=%d", p.setCalls, p.deletes, reg.updates)
+	}
+	if phase := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)].Phase; phase != model.PhaseWaitRetire {
+		t.Fatalf("phase=%s", phase)
+	}
+}
+
+func TestReconcileSplitSignerTransitionRejectsTransitionalPowerDNSLabels(t *testing.T) {
+	zone := "example.test."
+	keys := []model.Key{
+		{ID: 1, KeyType: "csk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 AQID"},
+		{ID: 2, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 BAUG"},
+		{ID: 3, KeyType: "zsk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "256 3 13 BwgJ"},
+	}
+	newKSK, err := dnsprobe.DNSSECDataForKey(zone, keys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &recordingPDNS{zones: []model.Zone{{ID: zone, Name: zone, DNSSEC: true}}, keys: map[string][]model.Key{zone: keys}}
+	c, st := newTestController(t, p, &splitSignerTransitionObserver{oldKeyID: 1})
+	c.registrar = &fakeRegistrar{state: autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{newKSK}}}
+	w := model.Workflow{Zone: zone, Kind: model.KindSplit, Phase: model.PhaseWaitNewSignature, OldKeyID: 1, NewKeyID: 2, NewZSKID: 3, ParentMode: parentModeInitial, RegistrarAttemptedAt: c.clock.Now().Add(-time.Hour), RegistrarCTID: "dnssec-split-test"}
+	if err := st.Update(func(s *model.State) error { s.Workflows[model.WorkflowKey(zone, model.KindSplit)] = w; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ReconcileSplitSignerTransition(context.Background(), zone, "split-signer-test-0002"); err == nil {
+		t.Fatal("transitional PowerDNS key labels were accepted")
+	}
+	got := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+	if !got.SplitSignerTransitionAt.IsZero() || got.Phase != model.PhaseWaitNewSignature {
+		t.Fatalf("workflow changed after rejected reconciliation: %+v", got)
+	}
+	if p.setCalls != 0 || p.deletes != 0 {
+		t.Fatal("rejected reconciliation mutated PowerDNS")
+	}
+}
+
+func TestReconcileSplitSignerTransitionRejectsEveryIncompleteEvidenceSurface(t *testing.T) {
+	zone := "example.test."
+	baseKeys := []model.Key{
+		{ID: 1, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 AQID"},
+		{ID: 2, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 BAUG"},
+		{ID: 3, KeyType: "zsk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "256 3 13 BwgJ"},
+	}
+	newKSK, err := dnsprobe.DNSSECDataForKey(zone, baseKeys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKSK, err := dnsprobe.DNSSECDataForKey(zone, baseKeys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*model.Workflow, *[]model.Key, *fakeRegistrar, *splitSignerTransitionObserver)
+	}{
+		{name: "missing recorded id", mutate: func(w *model.Workflow, _ *[]model.Key, _ *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			w.NewZSKID = 0
+		}},
+		{name: "duplicate recorded id", mutate: func(w *model.Workflow, _ *[]model.Key, _ *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			w.NewZSKID = w.NewKeyID
+		}},
+		{name: "changed recorded id", mutate: func(w *model.Workflow, _ *[]model.Key, _ *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			w.NewZSKID = 4
+		}},
+		{name: "extra published key", mutate: func(_ *model.Workflow, keys *[]model.Key, _ *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			*keys = append(*keys, model.Key{ID: 4, KeyType: "zsk", Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "256 3 13 CgsM"})
+		}},
+		{name: "inactive replacement zsk", mutate: func(_ *model.Workflow, keys *[]model.Key, _ *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			(*keys)[2].Active = false
+		}},
+		{name: "unpublished replacement ksk", mutate: func(_ *model.Workflow, keys *[]model.Key, _ *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			(*keys)[1].Published = false
+		}},
+		{name: "wrong dnskey flags", mutate: func(_ *model.Workflow, keys *[]model.Key, _ *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			(*keys)[0].DNSKEY = "256 3 13 AQID"
+		}},
+		{name: "algorithm mismatch", mutate: func(_ *model.Workflow, keys *[]model.Key, _ *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			(*keys)[2].Algorithm = "RSASHA256"
+			(*keys)[2].DNSKEY = "256 3 8 BwgJ"
+		}},
+		{name: "disabled registrar", mutate: func(_ *model.Workflow, _ *[]model.Key, reg *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			reg.state = autodns.DomainDNSSECState{Enabled: false, Data: []model.DNSSECData{newKSK}}
+		}},
+		{name: "old registrar material", mutate: func(_ *model.Workflow, _ *[]model.Key, reg *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			reg.state = autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{oldKSK}}
+		}},
+		{name: "mixed registrar material", mutate: func(_ *model.Workflow, _ *[]model.Key, reg *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			reg.state = autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{oldKSK, newKSK}}
+		}},
+		{name: "missing registrar material", mutate: func(_ *model.Workflow, _ *[]model.Key, reg *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			reg.state = autodns.DomainDNSSECState{Enabled: true}
+		}},
+		{name: "missing authoritative parent ds", mutate: func(_ *model.Workflow, _ *[]model.Key, _ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.authDSErr = errors.New("authoritative DS missing")
+		}},
+		{name: "unauthenticated resolver ds", mutate: func(_ *model.Workflow, _ *[]model.Key, _ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.dsErr = errors.New("AD missing")
+		}},
+		{name: "missing exact dnskey set", mutate: func(_ *model.Workflow, _ *[]model.Key, _ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.dnskeyErr = errors.New("DNSKEY mismatch")
+		}},
+		{name: "missing replacement ksk signature", mutate: func(_ *model.Workflow, _ *[]model.Key, _ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.dnskeySigErr = errors.New("KSK signature missing")
+		}},
+		{name: "missing replacement zsk signature", mutate: func(_ *model.Workflow, _ *[]model.Key, _ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.zskSigErr = errors.New("ZSK signature missing")
+		}},
+		{name: "changed parent delegation", mutate: func(_ *model.Workflow, _ *[]model.Key, _ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.delegationErr = errors.New("delegation changed")
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			keys := append([]model.Key(nil), baseKeys...)
+			p := &recordingPDNS{zones: []model.Zone{{ID: zone, Name: zone, DNSSEC: true}}, keys: map[string][]model.Key{zone: keys}}
+			reg := &fakeRegistrar{state: autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{newKSK}}}
+			obs := &splitSignerTransitionObserver{oldKeyID: 1}
+			c, st := newTestController(t, p, obs)
+			c.registrar = reg
+			w := model.Workflow{Zone: zone, Kind: model.KindSplit, Phase: model.PhaseWaitNewSignature, OldKeyID: 1, NewKeyID: 2, NewZSKID: 3, ParentMode: parentModeInitial, RegistrarAttemptedAt: c.clock.Now().Add(-time.Hour), RegistrarCTID: "dnssec-split-test", LastError: "old CSK overlap signature missing"}
+			tc.mutate(&w, &keys, reg, obs)
+			p.keys[zone] = keys
+			if err := st.Update(func(s *model.State) error { s.Workflows[model.WorkflowKey(zone, model.KindSplit)] = w; return nil }); err != nil {
+				t.Fatal(err)
+			}
+			before := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+			if err := c.ReconcileSplitSignerTransition(context.Background(), zone, "split-signer-negative-0001"); err == nil {
+				t.Fatal("incomplete evidence was accepted")
+			}
+			after := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+			if after != before {
+				t.Fatalf("workflow changed: before=%+v after=%+v", before, after)
+			}
+			if p.creates != 0 || p.setCalls != 0 || p.deletes != 0 || reg.updates != 0 {
+				t.Fatalf("rejected reconciliation mutated external state: pdns=%d/%d/%d registrar=%d", p.creates, p.setCalls, p.deletes, reg.updates)
+			}
+		})
+	}
+}
+
+func TestReconciledSplitSignerTransitionRestartsWaitWhenLiveTTLGrows(t *testing.T) {
+	zone := "example.test."
+	keys := []model.Key{
+		{ID: 1, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 AQID"},
+		{ID: 2, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 BAUG"},
+		{ID: 3, KeyType: "zsk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "256 3 13 BwgJ"},
+	}
+	newKSK, err := dnsprobe.DNSSECDataForKey(zone, keys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &recordingPDNS{zones: []model.Zone{{ID: zone, Name: zone, DNSSEC: true}}, keys: map[string][]model.Key{zone: keys}}
+	c, st := newTestController(t, p, &splitSignerTransitionObserver{oldKeyID: 1})
+	c.registrar = &fakeRegistrar{state: autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{newKSK}}}
+	w := model.Workflow{Zone: zone, Kind: model.KindSplit, Phase: model.PhaseWaitNewSignature, OldKeyID: 1, NewKeyID: 2, NewZSKID: 3, ParentMode: parentModeInitial, RegistrarAttemptedAt: c.clock.Now().Add(-time.Hour), RegistrarCTID: "dnssec-split-test"}
+	if err := st.Update(func(s *model.State) error { s.Workflows[model.WorkflowKey(zone, model.KindSplit)] = w; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ReconcileSplitSignerTransition(context.Background(), zone, "split-signer-ttl-test-0001"); err != nil {
+		t.Fatal(err)
+	}
+	attested := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+	c.clock = fixedClock{attested.NextActionAt}
+	p.zoneTTL = uint32((48 * time.Hour) / time.Second)
+	if err := c.waitNewSignature(context.Background(), model.Zone{ID: zone, Name: zone}, keys, attested); err != nil {
+		t.Fatal(err)
+	}
+	got := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+	if got.Phase != model.PhaseWaitNewSignature || got.ZoneTTL != int64(48*time.Hour/time.Second) || !got.SplitSignerTransitionAt.Equal(c.clock.Now()) {
+		t.Fatalf("workflow=%+v", got)
+	}
+	if !got.NextActionAt.Equal(c.clock.Now().Add(50*time.Hour)) || p.setCalls != 0 {
+		t.Fatalf("nextActionAt=%s setCalls=%d", got.NextActionAt, p.setCalls)
+	}
+}
+
+func TestReconciledSplitSignerTransitionFailsClosedOnRegistrarDrift(t *testing.T) {
+	zone := "example.test."
+	keys := []model.Key{
+		{ID: 1, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 AQID"},
+		{ID: 2, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 BAUG"},
+		{ID: 3, KeyType: "zsk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "256 3 13 BwgJ"},
+	}
+	newKSK, err := dnsprobe.DNSSECDataForKey(zone, keys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &recordingPDNS{zones: []model.Zone{{ID: zone, Name: zone, DNSSEC: true}}, keys: map[string][]model.Key{zone: keys}}
+	reg := &fakeRegistrar{state: autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{newKSK}}}
+	c, st := newTestController(t, p, &splitSignerTransitionObserver{oldKeyID: 1})
+	c.registrar = reg
+	w := model.Workflow{Zone: zone, Kind: model.KindSplit, Phase: model.PhaseWaitNewSignature, OldKeyID: 1, NewKeyID: 2, NewZSKID: 3, ParentMode: parentModeInitial, RegistrarAttemptedAt: c.clock.Now().Add(-time.Hour), RegistrarCTID: "dnssec-split-test"}
+	if err := st.Update(func(s *model.State) error { s.Workflows[model.WorkflowKey(zone, model.KindSplit)] = w; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ReconcileSplitSignerTransition(context.Background(), zone, "split-signer-drift-0001"); err != nil {
+		t.Fatal(err)
+	}
+	attested := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+	c.clock = fixedClock{attested.NextActionAt}
+	reg.state = autodns.DomainDNSSECState{Enabled: false}
+	if err := c.waitNewSignature(context.Background(), model.Zone{ID: zone, Name: zone}, keys, attested); err == nil {
+		t.Fatal("registrar drift did not fail closed")
+	}
+	if p.setCalls != 0 || st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)].Phase != model.PhaseWaitNewSignature {
+		t.Fatal("registrar drift advanced or mutated the workflow")
+	}
+}
+
+func TestReconciledSplitSignerTransitionRevalidatesEveryGateBeforeSetKey(t *testing.T) {
+	zone := "example.test."
+	baseKeys := []model.Key{
+		{ID: 1, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 AQID"},
+		{ID: 2, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 BAUG"},
+		{ID: 3, KeyType: "zsk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "256 3 13 BwgJ"},
+	}
+	newKSK, err := dnsprobe.DNSSECDataForKey(zone, baseKeys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name  string
+		drift func(*fakeRegistrar, *splitSignerTransitionObserver)
+	}{
+		{name: "registrar", drift: func(reg *fakeRegistrar, _ *splitSignerTransitionObserver) {
+			reg.state = autodns.DomainDNSSECState{Enabled: false}
+		}},
+		{name: "authoritative parent ds", drift: func(_ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.authDSErr = errors.New("authoritative DS drift")
+		}},
+		{name: "validating resolver ds", drift: func(_ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.dsErr = errors.New("AD-validating DS drift")
+		}},
+		{name: "dnskey set", drift: func(_ *fakeRegistrar, obs *splitSignerTransitionObserver) { obs.dnskeyErr = errors.New("DNSKEY drift") }},
+		{name: "replacement ksk signature", drift: func(_ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.dnskeySigErr = errors.New("KSK signature drift")
+		}},
+		{name: "replacement zsk signature", drift: func(_ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.zskSigErr = errors.New("ZSK signature drift")
+		}},
+		{name: "delegation", drift: func(_ *fakeRegistrar, obs *splitSignerTransitionObserver) {
+			obs.delegationErr = errors.New("delegation drift")
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			keys := append([]model.Key(nil), baseKeys...)
+			p := &recordingPDNS{zones: []model.Zone{{ID: zone, Name: zone, DNSSEC: true}}, keys: map[string][]model.Key{zone: keys}}
+			reg := &fakeRegistrar{state: autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{newKSK}}}
+			obs := &splitSignerTransitionObserver{oldKeyID: 1}
+			c, st := newTestController(t, p, obs)
+			c.registrar = reg
+			w := model.Workflow{Zone: zone, Kind: model.KindSplit, Phase: model.PhaseWaitNewSignature, OldKeyID: 1, NewKeyID: 2, NewZSKID: 3, ParentMode: parentModeInitial, RegistrarAttemptedAt: c.clock.Now().Add(-time.Hour), RegistrarCTID: "dnssec-split-test"}
+			if err := st.Update(func(s *model.State) error { s.Workflows[model.WorkflowKey(zone, model.KindSplit)] = w; return nil }); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.ReconcileSplitSignerTransition(context.Background(), zone, "split-signer-mutation-0001"); err != nil {
+				t.Fatal(err)
+			}
+			attested := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+			c.clock = fixedClock{attested.NextActionAt}
+			if err := c.waitNewSignature(context.Background(), model.Zone{ID: zone, Name: zone}, keys, attested); err != nil {
+				t.Fatal(err)
+			}
+			ready := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+			if ready.Phase != model.PhaseDeactivateOld {
+				t.Fatalf("phase=%s", ready.Phase)
+			}
+			tc.drift(reg, obs)
+			if err := c.deactivateOld(context.Background(), model.Zone{ID: zone, Name: zone}, keys, ready); err == nil {
+				t.Fatal("mutation-time evidence drift was accepted")
+			}
+			if p.setCalls != 0 || p.deletes != 0 || reg.updates != 0 {
+				t.Fatalf("evidence drift reached an external mutation: set=%d delete=%d registrar=%d", p.setCalls, p.deletes, reg.updates)
+			}
+			if phase := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)].Phase; phase != model.PhaseDeactivateOld {
+				t.Fatalf("phase=%s", phase)
+			}
+		})
 	}
 }
 

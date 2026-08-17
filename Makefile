@@ -43,6 +43,7 @@ openapi-check:
 	@grep -Eq '^openapi: 3\.1\.0$$' api/openapi.yaml
 	@grep -Eq '^  /v1/rotations/trigger:' api/openapi.yaml
 	@grep -Eq '^  /v1/rotations/resume:' api/openapi.yaml
+	@grep -Eq '^  /v1/rotations/reconcile-split-signer:' api/openapi.yaml
 	@grep -Eq '^  /v1/enrollment/arm:' api/openapi.yaml
 
 license-check:
