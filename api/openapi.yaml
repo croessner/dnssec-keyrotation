@@ -103,6 +103,23 @@ paths:
       responses:
         '202': {description: Recovery transition persisted}
         '409': {description: Live invariant, workflow state, or idempotency conflict}
+  /v1/rotations/reconcile-split-signer:
+    post:
+      operationId: reconcileSplitSignerTransition
+      description: Revalidate one exact PowerDNS post-activation split signer-role transition and persist a fresh full zone-TTL wait. This operation performs no PowerDNS or registrar write.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, minLength: 16, maxLength: 128}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SplitSignerTransitionRequest'}
+      responses:
+        '202': {description: Exact signer-role transition attested}
+        '409': {description: Live invariant, workflow state, or idempotency conflict}
   /v1/enrollment/arm:
     post:
       operationId: armAutomaticEnrollment
@@ -180,6 +197,7 @@ components:
         registrarAttemptedAt: {type: string, format: date-time}
         registrarPayloadHash: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
         parentMode: {type: string, enum: [existing, initial]}
+        splitSignerTransitionAt: {type: string, format: date-time}
         discoveredAt: {type: string, format: date-time}
         keysetFingerprint: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
         enrollmentDisposition: {type: string, enum: [baseline, candidate, enrolled, ineligible]}
@@ -223,6 +241,13 @@ components:
           uniqueItems: true
           items: {type: string}
         phase: {type: string, const: wait_publish}
+        confirm: {type: boolean, const: true}
+    SplitSignerTransitionRequest:
+      type: object
+      additionalProperties: false
+      required: [zone, confirm]
+      properties:
+        zone: {type: string, minLength: 1}
         confirm: {type: boolean, const: true}
     ArmEnrollmentRequest:
       type: object

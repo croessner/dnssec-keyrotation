@@ -1,6 +1,6 @@
 module github.com/croessner/dnssec-keyrotation
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/miekg/dns v1.1.72

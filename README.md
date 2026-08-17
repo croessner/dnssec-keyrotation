@@ -38,6 +38,7 @@ Private keys never leave PowerDNS. The registrar receives public KSK material on
   - [Plan a rotation](#plan-a-rotation)
   - [Trigger a rotation](#trigger-a-rotation)
   - [Resume a blocked split migration](#resume-a-blocked-split-migration)
+  - [Reconcile a PowerDNS split signer transition](#reconcile-a-powerdns-split-signer-transition)
   - [Arm automatic enrollment](#arm-automatic-enrollment)
 - [Health and operations](#health-and-operations)
 - [Persistence and failure handling](#persistence-and-failure-handling)
@@ -170,7 +171,7 @@ A baselined, completed, ineligible, drifted, removed, or DNSSEC-disabled zone is
 - A writable state directory under `/var/lib/dnssec-keyrotation`.
 - A writable runtime directory under `/run/dnssec-keyrotation`.
 - Two mode-`0600` secret files under `/run/secrets`.
-- Go 1.26.5 when building from source.
+- Go 1.26.6 when building from source.
 - Optional: a private or loopback LMTP endpoint for completion reports.
 
 The controller intentionally rejects remote plaintext PowerDNS API URLs, unapproved registrar API hosts, insufficient DNS evidence paths, weak propagation limits, and permissive secret-file modes.
@@ -360,6 +361,7 @@ dnssecctl [--socket /run/dnssec-keyrotation/control.sock] <command>
 | `plan --kind <kind> --zone <zone>` | None | Describe the modeled mutations for `zsk`, `ksk`, or `split`. |
 | `trigger ... --confirm --idempotency-key <key>` | Persists workflow | Start a confirmed manual ZSK, KSK, or split workflow. |
 | `resume ... --confirm --idempotency-key <key>` | State only | Revalidate and resume one exact blocked initial split state. |
+| `reconcile-split-signer ... --confirm --idempotency-key <key>` | State only | Attest one exact post-activation PowerDNS signer-role transition and restart the full zone-TTL wait. |
 | `enrollment status` | None | Print aggregate status including enrollment counts and arm state. |
 | `enrollment arm --confirm --idempotency-key <key>` | State only | Persist the one-time baseline required for automatic enrollment. |
 
@@ -429,6 +431,19 @@ dnssecctl resume \
 Resume is intentionally narrow. It can only move a blocked initial `split` workflow back to `wait_publish` after proving the exact recorded three-key inventory, disabled-empty registrar state, absence of a registrar attempt, and fresh cryptographic parent DS absence. The operation itself performs no PowerDNS or InternetX write and restarts the complete DNSKEY publication wait.
 
 Do not edit the state file to recover a zone.
+
+### Reconcile a PowerDNS split signer transition
+
+Some PowerDNS versions report the old CSK as a KSK after the recorded replacement ZSK becomes active. The old key then no longer produces zone-data signatures, so the ordinary overlap gate cannot complete. This recovery is deliberately separate from `resume` and accepts exactly one zone:
+
+```sh
+dnssecctl reconcile-split-signer \
+  --zone example.test \
+  --confirm \
+  --idempotency-key operator-20260817-example-signer-transition
+```
+
+The command performs no PowerDNS or registrar write. It accepts only an existing initial split workflow in `wait_new_signature` and re-proves the exact recorded three-key `ksk`/`ksk`/`zsk` inventory, DNSKEY roles and algorithms, new-only InternetX material, authoritative and AD-validating parent DS, DNSKEY and replacement signatures, exact delegation, and the live maximum zone TTL. It then starts a fresh full zone-TTL plus propagation-margin wait. All evidence is checked again before the controller may deactivate the recorded old key. A second zone requires its own explicit request and idempotency key.
 
 ### Arm automatic enrollment
 

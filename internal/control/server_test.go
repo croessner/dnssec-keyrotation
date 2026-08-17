@@ -14,6 +14,7 @@ import (
 	"github.com/croessner/dnssec-keyrotation/internal/autodns"
 	"github.com/croessner/dnssec-keyrotation/internal/config"
 	"github.com/croessner/dnssec-keyrotation/internal/controller"
+	"github.com/croessner/dnssec-keyrotation/internal/dnsprobe"
 	"github.com/croessner/dnssec-keyrotation/internal/model"
 	"github.com/croessner/dnssec-keyrotation/internal/state"
 )
@@ -39,10 +40,13 @@ func (p *resumePDNS) SetKey(context.Context, string, model.Key, bool, bool) erro
 }
 func (p *resumePDNS) DeleteKey(context.Context, string, int) error { p.deletes++; return nil }
 
-type resumeRegistrar struct{ updates int }
+type resumeRegistrar struct {
+	updates int
+	state   autodns.DomainDNSSECState
+}
 
-func (*resumeRegistrar) DomainDNSSEC(context.Context, string) (autodns.DomainDNSSECState, error) {
-	return autodns.DomainDNSSECState{Enabled: false}, nil
+func (r *resumeRegistrar) DomainDNSSEC(context.Context, string) (autodns.DomainDNSSECState, error) {
+	return r.state, nil
 }
 func (r *resumeRegistrar) UpdateDNSSEC(context.Context, string, []model.DNSSECData, string) (autodns.Job, error) {
 	r.updates++
@@ -116,5 +120,56 @@ func TestResumeHandlerPerformsOnlyGuardedStateTransition(t *testing.T) {
 	}
 	if p.creates != 0 || p.sets != 0 || p.deletes != 0 || reg.updates != 0 {
 		t.Fatalf("external mutation during resume: pdns=%d/%d/%d registrar=%d", p.creates, p.sets, p.deletes, reg.updates)
+	}
+}
+
+func TestReconcileSplitSignerHandlerAttestsOneZoneWithoutExternalMutation(t *testing.T) {
+	zone := "example.test."
+	keys := []model.Key{
+		{ID: 1, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 AQID"},
+		{ID: 2, KeyType: "ksk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "257 3 13 BAUG"},
+		{ID: 3, KeyType: "zsk", Active: true, Published: true, Algorithm: "ECDSAP256SHA256", DNSKEY: "256 3 13 BwgJ"},
+	}
+	expected, err := dnsprobe.DNSSECDataForKey(zone, keys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &resumePDNS{zone: model.Zone{ID: zone, Name: zone, DNSSEC: true}, keys: keys}
+	reg := &resumeRegistrar{state: autodns.DomainDNSSECState{Enabled: true, Data: []model.DNSSECData{expected}}}
+	st, err := state.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	wf := model.Workflow{Zone: zone, Kind: model.KindSplit, Phase: model.PhaseWaitNewSignature, ParentMode: "initial", OldKeyID: 1, NewKeyID: 2, NewZSKID: 3, RegistrarCTID: "dnssec-split-test", RegistrarAttemptedAt: time.Now().Add(-time.Hour)}
+	if err := st.Update(func(s *model.State) error { s.Workflows[model.WorkflowKey(zone, model.KindSplit)] = wf; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Mode: "enforce", Controller: config.Controller{PropagationMargin: 2 * time.Hour}, DNS: config.DNS{ExpectedNameservers: []string{"ns1.example.test", "ns2.example.test"}}}
+	c := controller.New(cfg, p, reg, &resumeObserver{}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(c, filepath.Join(t.TempDir(), "control.sock"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	httpServer := httptest.NewServer(s.http.Handler)
+	defer httpServer.Close()
+
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/rotations/reconcile-split-signer", bytes.NewBufferString(`{"zone":"example.test","confirm":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "signer-handler-test-0001")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	got := st.Snapshot().Workflows[model.WorkflowKey(zone, model.KindSplit)]
+	if got.SplitSignerTransitionAt.IsZero() || got.Phase != model.PhaseWaitNewSignature {
+		t.Fatalf("workflow=%+v", got)
+	}
+	if p.creates != 0 || p.sets != 0 || p.deletes != 0 || reg.updates != 0 {
+		t.Fatalf("external mutation during reconciliation: pdns=%d/%d/%d registrar=%d", p.creates, p.sets, p.deletes, reg.updates)
 	}
 }

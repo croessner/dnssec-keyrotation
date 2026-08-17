@@ -34,7 +34,7 @@ func root() *cobra.Command {
 	var socket string
 	r := &cobra.Command{Use: "dnssecctl", Short: "DNSSEC key rotation controller and CLI", SilenceUsage: true, SilenceErrors: true}
 	r.PersistentFlags().StringVar(&socket, "socket", "/run/dnssec-keyrotation/control.sock", "controller Unix socket")
-	r.AddCommand(serveCmd(), versionCmd(), getCmd(&socket, "status", "/v1/status", func() any { return &controller.Status{} }), getCmd(&socket, "zones", "/v1/zones", func() any { return &[]controller.ZoneStatus{} }), planCmd(&socket), triggerCmd(&socket), resumeCmd(&socket), enrollmentCmd(&socket))
+	r.AddCommand(serveCmd(), versionCmd(), getCmd(&socket, "status", "/v1/status", func() any { return &controller.Status{} }), getCmd(&socket, "zones", "/v1/zones", func() any { return &[]controller.ZoneStatus{} }), planCmd(&socket), triggerCmd(&socket), resumeCmd(&socket), reconcileSplitSignerCmd(&socket), enrollmentCmd(&socket))
 	r.AddCommand(getCmd(&socket, "audit", "/v1/audit", func() any { return &[]controller.AuditResult{} }))
 	return r
 }
@@ -161,6 +161,29 @@ func resumeCmd(socket *string) *cobra.Command {
 	}}
 	c.Flags().StringSliceVar(&zones, "zone", nil, "blocked split zone (repeat or comma-separate)")
 	c.Flags().BoolVar(&confirm, "confirm", false, "confirm recovery state transition")
+	c.Flags().StringVar(&idem, "idempotency-key", "", "unique key of at least 16 characters")
+	_ = c.MarkFlagRequired("zone")
+	_ = c.MarkFlagRequired("idempotency-key")
+	return c
+}
+
+func reconcileSplitSignerCmd(socket *string) *cobra.Command {
+	var zone string
+	var confirm bool
+	var idem string
+	c := &cobra.Command{Use: "reconcile-split-signer", Short: "Attest one exact PowerDNS split signer-role transition", RunE: func(cmd *cobra.Command, _ []string) error {
+		if !confirm {
+			return errors.New("--confirm is required")
+		}
+		req := control.SplitSignerTransitionRequest{Zone: strings.TrimSpace(zone), Confirm: true}
+		var out map[string]string
+		if err := control.NewClient(*socket).Post(cmd.Context(), "/v1/rotations/reconcile-split-signer", req, idem, &out); err != nil {
+			return err
+		}
+		return printJSON(out)
+	}}
+	c.Flags().StringVar(&zone, "zone", "", "one split zone in wait_new_signature")
+	c.Flags().BoolVar(&confirm, "confirm", false, "confirm the state-only signer-transition attestation")
 	c.Flags().StringVar(&idem, "idempotency-key", "", "unique key of at least 16 characters")
 	_ = c.MarkFlagRequired("zone")
 	_ = c.MarkFlagRequired("idempotency-key")

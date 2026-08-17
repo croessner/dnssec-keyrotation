@@ -602,12 +602,32 @@ func (c *Controller) waitNewSignature(ctx context.Context, zone model.Zone, keys
 		return c.transition(w, model.PhaseWaitNewSignature, c.clock.Now(), func(x *model.Workflow) { x.ZoneTTL = int64(ttl / time.Second) })
 	}
 	if w.Kind == model.KindSplit {
-		if err := c.observer.RRSIGBy(ctx, zone.Name, old); err != nil {
-			return fmt.Errorf("old CSK overlap signature missing: %w", err)
-		}
-		if w.EvidenceAt.IsZero() {
-			wait := time.Duration(w.ZoneTTL)*time.Second + c.cfg.Controller.PropagationMargin
-			return c.transition(w, model.PhaseWaitNewSignature, c.clock.Now().Add(wait), func(x *model.Workflow) { x.EvidenceAt = c.clock.Now() })
+		if w.SplitSignerTransitionAt.IsZero() {
+			if err := c.observer.RRSIGBy(ctx, zone.Name, old); err != nil {
+				return fmt.Errorf("old CSK overlap signature missing: %w", err)
+			}
+			if w.EvidenceAt.IsZero() {
+				wait := time.Duration(w.ZoneTTL)*time.Second + c.cfg.Controller.PropagationMargin
+				return c.transition(w, model.PhaseWaitNewSignature, c.clock.Now().Add(wait), func(x *model.Workflow) { x.EvidenceAt = c.clock.Now() })
+			}
+		} else {
+			deadline := w.SplitSignerTransitionAt.Add(time.Duration(w.ZoneTTL)*time.Second + c.cfg.Controller.PropagationMargin)
+			if c.clock.Now().Before(deadline) {
+				return c.transition(w, model.PhaseWaitNewSignature, deadline, nil)
+			}
+			currentTTL, err := c.validateSplitSignerTransitionEvidence(ctx, zone, keys, w)
+			if err != nil {
+				return fmt.Errorf("split signer-transition evidence: %w", err)
+			}
+			if currentTTL > w.ZoneTTL {
+				now := c.clock.Now()
+				wait := time.Duration(currentTTL)*time.Second + c.cfg.Controller.PropagationMargin
+				return c.transition(w, model.PhaseWaitNewSignature, now.Add(wait), func(x *model.Workflow) {
+					x.ZoneTTL = currentTTL
+					x.EvidenceAt = now
+					x.SplitSignerTransitionAt = now
+				})
+			}
 		}
 	}
 	return c.transition(w, model.PhaseDeactivateOld, c.clock.Now(), func(x *model.Workflow) { x.EvidenceAt = time.Time{} })
@@ -619,6 +639,21 @@ func (c *Controller) deactivateOld(ctx context.Context, zone model.Zone, keys []
 		postErr := validateDeactivatedSplitInventory(zone.Name, keys, w)
 		if preErr != nil && postErr != nil {
 			return c.block(zone.Name, w.Kind, fmt.Sprintf("split deactivation inventory is neither exact pre-state nor exact post-state: pre=%v; post=%v", preErr, postErr))
+		}
+		if !w.SplitSignerTransitionAt.IsZero() && preErr == nil {
+			currentTTL, err := c.validateSplitSignerTransitionEvidence(ctx, zone, keys, w)
+			if err != nil {
+				return fmt.Errorf("split signer-transition evidence before old-key deactivation: %w", err)
+			}
+			if currentTTL > w.ZoneTTL {
+				now := c.clock.Now()
+				wait := time.Duration(currentTTL)*time.Second + c.cfg.Controller.PropagationMargin
+				return c.transition(w, model.PhaseWaitNewSignature, now.Add(wait), func(x *model.Workflow) {
+					x.ZoneTTL = currentTTL
+					x.EvidenceAt = now
+					x.SplitSignerTransitionAt = now
+				})
+			}
 		}
 	}
 	old, newKey, err := recordedKeys(keys, w.OldKeyID, w.NewKeyID)
@@ -1146,6 +1181,17 @@ func (c *Controller) deleteOld(ctx context.Context, zone model.Zone, keys []mode
 		if err := c.observer.RRSIGBy(ctx, zone.Name, z); err != nil {
 			return err
 		}
+		remote, err := c.registrar.DomainDNSSEC(ctx, zone.Name)
+		if err != nil {
+			return err
+		}
+		expected, err := dnsprobe.DNSSECDataForKey(zone.Name, newKey)
+		if err != nil {
+			return err
+		}
+		if !remote.Enabled || !sameMaterial(remote.Data, []model.DNSSECData{expected}) {
+			return c.block(zone.Name, w.Kind, "InternetX material is not exact new-only KSK before old-key deletion")
+		}
 		dnskeys = append(dnskeys, z)
 	case model.KindZSK:
 		if err := c.observer.RRSIGBy(ctx, zone.Name, newKey); err != nil {
@@ -1590,6 +1636,101 @@ func (c *Controller) Resume(ctx context.Context, kind model.Kind, zones []string
 	})
 }
 
+// ReconcileSplitSignerTransition attests one exact PowerDNS post-activation
+// signer-role transition. It is state-only and starts a fresh full zone-TTL
+// wait after all live evidence has passed.
+func (c *Controller) ReconcileSplitSignerTransition(ctx context.Context, requestedZone, idem string) error {
+	if c.cfg.Mode != "enforce" {
+		return errors.New("controller is in observe mode")
+	}
+	if len(idem) < 16 || len(idem) > 128 {
+		return errors.New("idempotency key must be between 16 and 128 characters")
+	}
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(requestedZone)), ".")
+	if name == "" {
+		return errors.New("one zone is required")
+	}
+	fingerprint := "reconcile-split-signer|" + name
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.store.Snapshot()
+	if existing, ok := st.Idempotency[idem]; ok {
+		if existing == fingerprint {
+			return nil
+		}
+		return errors.New("idempotency key already used for a different request")
+	}
+
+	available, err := c.pdns.ListZones(ctx)
+	if err != nil {
+		return err
+	}
+	var zone model.Zone
+	for _, candidate := range available {
+		if strings.TrimSuffix(strings.ToLower(candidate.Name), ".") == name {
+			zone = candidate
+			break
+		}
+	}
+	if zone.Name == "" || !zone.DNSSEC {
+		return fmt.Errorf("zone %s is absent or not DNSSEC-enabled", name)
+	}
+	if !c.selected(zone.Name) {
+		return fmt.Errorf("zone %s is outside the configured rotation scope", name)
+	}
+	w, ok := st.Workflows[model.WorkflowKey(zone.Name, model.KindSplit)]
+	if !ok || w.Phase != model.PhaseWaitNewSignature {
+		return fmt.Errorf("zone %s has no split workflow in wait_new_signature", name)
+	}
+	if w.ParentMode != parentModeInitial || w.OldKeyID == 0 || w.NewKeyID == 0 || w.NewZSKID == 0 {
+		return fmt.Errorf("zone %s is not an initialized initial-delegation split workflow", name)
+	}
+	if w.OldKeyID == w.NewKeyID || w.OldKeyID == w.NewZSKID || w.NewKeyID == w.NewZSKID {
+		return fmt.Errorf("zone %s does not record three distinct key IDs", name)
+	}
+	if w.RegistrarAttemptedAt.IsZero() || w.RegistrarCTID == "" {
+		return fmt.Errorf("zone %s has no recorded registrar transaction", name)
+	}
+	if !w.SplitSignerTransitionAt.IsZero() {
+		return fmt.Errorf("zone %s already has a split signer-transition attestation", name)
+	}
+	keys, err := c.pdns.ListKeys(ctx, zone.ID)
+	if err != nil {
+		return err
+	}
+	ttl, err := c.validateSplitSignerTransitionEvidence(ctx, zone, keys, w)
+	if err != nil {
+		return fmt.Errorf("zone %s cannot reconcile split signer transition: %w", name, err)
+	}
+	if w.ZoneTTL > ttl {
+		ttl = w.ZoneTTL
+	}
+	now := c.clock.Now()
+	return c.store.Update(func(s *model.State) error {
+		if existing, ok := s.Idempotency[idem]; ok {
+			if existing == fingerprint {
+				return nil
+			}
+			return errors.New("idempotency key conflict")
+		}
+		key := model.WorkflowKey(zone.Name, model.KindSplit)
+		current, ok := s.Workflows[key]
+		if !ok || current.Phase != model.PhaseWaitNewSignature || current.OldKeyID != w.OldKeyID || current.NewKeyID != w.NewKeyID || current.NewZSKID != w.NewZSKID || !current.SplitSignerTransitionAt.IsZero() {
+			return fmt.Errorf("zone %s workflow changed during signer-transition validation", zone.Name)
+		}
+		current.SplitSignerTransitionAt = now
+		current.EvidenceAt = now
+		current.ZoneTTL = ttl
+		current.NextActionAt = now.Add(time.Duration(ttl)*time.Second + c.cfg.Controller.PropagationMargin)
+		current.LastError = ""
+		current.Attempts = 0
+		s.Workflows[key] = current
+		s.Idempotency[idem] = fingerprint
+		return nil
+	})
+}
+
 // Plan returns the ordered mutation summary for a rotation kind.
 func (c *Controller) Plan(kind model.Kind, zones []string) Plan {
 	m := map[model.Kind][]string{model.KindZSK: {"publish inactive ZSK", "observe and wait authoritative DNSKEY TTL", "activate new ZSK", "cryptographically prove new zone signatures", "deactivate old ZSK", "wait persisted pre-switch zone TTL", "delete old ZSK"}, model.KindKSK: {"publish active KSK and prove double DNSKEY signatures", "observe and wait authoritative DNSKEY TTL", "replace InternetX material with new-only KSK", "observe authoritative parent and wait full DS TTL", "verify exact new-only DS through validating resolvers", "deactivate and delete old KSK"}, model.KindSplit: {"publish active KSK and inactive ZSK", "prove and wait DNSKEY propagation", "replace parent material and wait DS TTL", "activate ZSK and prove overlapping CSK/ZSK signatures", "wait zone TTL, deactivate CSK, wait zone TTL again", "verify and delete CSK"}}
@@ -1989,6 +2130,73 @@ func validateActiveSplitInventory(zone string, keys []model.Key, w model.Workflo
 
 func validateDeactivatedSplitInventory(zone string, keys []model.Key, w model.Workflow) error {
 	return validateSplitMutationInventory(zone, keys, w, false)
+}
+
+func (c *Controller) validateSplitSignerTransitionEvidence(ctx context.Context, zone model.Zone, keys []model.Key, w model.Workflow) (int64, error) {
+	if err := validateActiveSplitInventory(zone.Name, keys, w); err != nil {
+		return 0, err
+	}
+	old, newKSK, err := recordedKeys(keys, w.OldKeyID, w.NewKeyID)
+	if err != nil {
+		return 0, err
+	}
+	newZSK, ok := byID(keys, w.NewZSKID)
+	if !ok {
+		return 0, fmt.Errorf("recorded replacement ZSK %d is missing", w.NewZSKID)
+	}
+	if old.KeyType != "ksk" || newKSK.KeyType != "ksk" || newZSK.KeyType != "zsk" {
+		return 0, fmt.Errorf("PowerDNS signer roles are %q/%q/%q, want exact ksk/ksk/zsk", old.KeyType, newKSK.KeyType, newZSK.KeyType)
+	}
+	for _, item := range []struct {
+		key  model.Key
+		role string
+	}{{old, "ksk"}, {newKSK, "ksk"}, {newZSK, "zsk"}} {
+		data, err := validatedKeyRole(zone.Name, item.key, item.role, false)
+		if err != nil {
+			return 0, err
+		}
+		if err := validateAlgorithmLabel(item.key.Algorithm, data.Algorithm); err != nil {
+			return 0, fmt.Errorf("key %d algorithm label: %w", item.key.ID, err)
+		}
+	}
+	expected, err := dnsprobe.DNSSECDataForKey(zone.Name, newKSK)
+	if err != nil {
+		return 0, err
+	}
+	remote, err := c.registrar.DomainDNSSEC(ctx, zone.Name)
+	if err != nil {
+		return 0, err
+	}
+	if !remote.Enabled || !sameMaterial(remote.Data, []model.DNSSECData{expected}) {
+		return 0, errors.New("InternetX material is not exact new-only replacement KSK")
+	}
+	if _, err := c.observer.AuthoritativeDSEvidence(ctx, zone.Name, []model.Key{newKSK}); err != nil {
+		return 0, fmt.Errorf("authoritative parent DS: %w", err)
+	}
+	if err := c.observer.DSEvidence(ctx, zone.Name, []model.Key{newKSK}); err != nil {
+		return 0, fmt.Errorf("AD-validating parent DS: %w", err)
+	}
+	if _, err := c.observer.DNSKEYEvidence(ctx, zone.Name, publishedKeys(keys)...); err != nil {
+		return 0, fmt.Errorf("exact DNSKEY evidence: %w", err)
+	}
+	if err := c.observer.DNSKEYRRSIGBy(ctx, zone.Name, newKSK); err != nil {
+		return 0, fmt.Errorf("replacement KSK DNSKEY signature: %w", err)
+	}
+	if err := c.observer.RRSIGBy(ctx, zone.Name, newZSK); err != nil {
+		return 0, fmt.Errorf("replacement ZSK zone signature: %w", err)
+	}
+	if err := c.observer.DelegationEvidence(ctx, zone.Name, c.cfg.DNS.ExpectedNameservers); err != nil {
+		return 0, fmt.Errorf("parent delegation: %w", err)
+	}
+	detail, err := c.pdns.GetZone(ctx, zone.ID)
+	if err != nil {
+		return 0, err
+	}
+	ttl := int64(maxTTL(detail) / time.Second)
+	if ttl <= 0 {
+		return 0, errors.New("zone maximum TTL is zero")
+	}
+	return ttl, nil
 }
 
 func validateSplitMutationInventory(zone string, keys []model.Key, w model.Workflow, oldActive bool) error {

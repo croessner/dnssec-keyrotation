@@ -41,9 +41,13 @@ PowerDNS derives the reported `keytype` from the active keys of an algorithm. Wh
 
 The closed inventory is revalidated throughout the long parent transition and immediately before both later PowerDNS mutations. Before ZSK activation it must match either the exact fully prepublished state (old CSK and new KSK active/published; new ZSK inactive/published) or the exact already-committed post-state with all three active/published. Before CSK deactivation it must match either the exact all-active/published pre-state or the exact post-state with only the old CSK inactive but still published. An exact post-state reconciles a lost mutation response and advances without another write; any other drift blocks. In particular, an unpublished replacement ZSK is never activated and must complete a new DNSKEY publication evidence and TTL wait before recovery can continue.
 
+Some PowerDNS versions change the old CSK's effective signer role to KSK as soon as the replacement ZSK becomes active. In that exact post-activation inventory, an old-CSK zone-data overlap signature is structurally unavailable even though the old DNSKEY remains active and published. The controller must not infer completion or silently skip the overlap gate. An operator may instead invoke the confirmed split signer-transition reconciliation. The operation accepts only an existing `initial` split workflow in `wait_new_signature` with all three recorded IDs and a recorded registrar transaction; exact PowerDNS `ksk`/`ksk`/`zsk` labels; closed active/published inventory; validated DNSKEY flags, protocol, and matching algorithms; exact new-only InternetX material; exact authoritative and AD-validated new-only parent DS; exact authoritative and recursive DNSKEY visibility; replacement KSK DNSKEY signatures; replacement ZSK zone signatures; and unchanged parent delegation. It atomically records the attestation time and the maximum live/persisted zone TTL, clears retry errors, and schedules a new complete zone-TTL plus propagation-margin wait. It performs no PowerDNS or registrar write. The full evidence set is revalidated after the wait and immediately before old-key deactivation. A larger live maximum TTL restarts the wait. Missing, extra, inferred, relabeled, inactive, unpublished, mismatching, unauthenticated, or stale evidence fails closed.
+
 ### Forward recovery
 
 `POST /v1/rotations/resume` is limited to a confirmed, idempotent `split` transition from `blocked` to `wait_publish`. Before one atomic state update, every requested zone must still be DNSSEC-enabled and prove `parentMode=initial`, three distinct recorded IDs, no registrar attempt or transaction, the exact transitional key inventory, InternetX disabled-empty state, and current cryptographic parent DS absence. The operation itself performs no PowerDNS or InternetX write. It clears DNSKEY evidence and its persisted TTL so the complete authoritative publication observation and wait run again.
+
+`POST /v1/rotations/reconcile-split-signer` is limited to the confirmed, idempotent state-only signer-transition reconciliation described above and accepts exactly one zone per request. A repeated request with the same idempotency key is a no-op; a different request cannot reset an existing attestation or its TTL wait.
 
 ## Automatic initial split-zone enrollment
 
@@ -62,7 +66,7 @@ If InternetX and the parent already contain exact matching material, a candidate
 
 ## API and CLI
 
-The control API is served only on a Unix socket. `api/openapi.yaml` is normative. The `dnssecctl` command uses that socket and provides health, status, zone, plan, confirmed trigger, guarded resume, and confirmed state-only enrollment arming operations. The controller API never exposes DNSKEY, DS, private material, or credentials.
+The control API is served only on a Unix socket. `api/openapi.yaml` is normative. The `dnssecctl` command uses that socket and provides health, status, zone, plan, confirmed trigger, guarded resume, guarded split signer-transition reconciliation, and confirmed state-only enrollment arming operations. The controller API never exposes DNSKEY, DS, private material, or credentials.
 
 ## Persistence and concurrency
 

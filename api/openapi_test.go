@@ -21,14 +21,14 @@ func TestOpenAPIContractIsClosedAndDocumentsRuntimePhases(t *testing.T) {
 		t.Fatalf("openapi=%v", doc["openapi"])
 	}
 	paths := mustMap(t, doc["paths"])
-	for _, path := range []string{"/healthz", "/readyz", "/v1/status", "/v1/zones", "/v1/audit", "/v1/rotations/plan", "/v1/rotations/trigger", "/v1/rotations/resume", "/v1/enrollment/arm"} {
+	for _, path := range []string{"/healthz", "/readyz", "/v1/status", "/v1/zones", "/v1/audit", "/v1/rotations/plan", "/v1/rotations/trigger", "/v1/rotations/resume", "/v1/rotations/reconcile-split-signer", "/v1/enrollment/arm"} {
 		if _, ok := paths[path]; !ok {
 			t.Fatalf("missing path %s", path)
 		}
 	}
 	components := mustMap(t, doc["components"])
 	schemas := mustMap(t, components["schemas"])
-	for _, name := range []string{"Status", "ZoneStatus", "Workflow", "RotationRequest", "TriggerRequest", "ResumeRequest", "ArmEnrollmentRequest", "Plan"} {
+	for _, name := range []string{"Status", "ZoneStatus", "Workflow", "RotationRequest", "TriggerRequest", "ResumeRequest", "SplitSignerTransitionRequest", "ArmEnrollmentRequest", "Plan"} {
 		schema := mustMap(t, schemas[name])
 		if schema["additionalProperties"] != false {
 			t.Fatalf("schema %s is not closed", name)
