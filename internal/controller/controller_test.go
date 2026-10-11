@@ -1694,7 +1694,10 @@ func TestDeleteAmbiguousSuccessReconcilesMissingOldKey(t *testing.T) {
 	if err := s.Update(func(st *model.State) error { st.Workflows[model.WorkflowKey(w.Zone, w.Kind)] = w; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	keys := []model.Key{{ID: 2, KeyType: "ksk", Active: true, Published: true, DNSKEY: "257 3 13 BAUG"}}
+	keys := []model.Key{
+		{ID: 2, KeyType: "ksk", Active: true, Published: true, DNSKEY: "257 3 13 BAUG"},
+		{ID: 3, KeyType: "zsk", Active: true, Published: true, DNSKEY: "256 3 13 BwgJ"},
+	}
 	if err := c.deleteOld(context.Background(), model.Zone{Name: w.Zone}, keys, w); err != nil {
 		t.Fatal(err)
 	}
@@ -1721,7 +1724,7 @@ func (o *retirementInventoryObserver) DNSKEYEvidence(_ context.Context, _ string
 
 func TestDeleteOldRequiresFullPublishedInventory(t *testing.T) {
 	for _, kind := range []model.Kind{model.KindZSK, model.KindKSK} {
-		for _, scenario := range []string{"present", "already_deleted", "evidence_failure", "active_old"} {
+		for _, scenario := range []string{"present", "already_deleted", "evidence_failure", "active_old", "extra_published", "unpublished_old", "missing_companion", "extra_active", "companion_csk", "companion_wrong_flags", "replacement_csk", "duplicate_id"} {
 			t.Run(string(kind)+"/"+scenario, func(t *testing.T) {
 				role, companionRole := "zsk", "ksk"
 				material, companionMaterial := "256 3 13 AQID", "257 3 13 BAUG"
@@ -1740,7 +1743,25 @@ func TestDeleteOldRequiresFullPublishedInventory(t *testing.T) {
 					published = append(published, old)
 				}
 				keys := append(append([]model.Key{}, published...), model.Key{ID: 4, KeyType: role, DNSKEY: material})
-				o := &retirementInventoryObserver{want: published}
+				switch scenario {
+				case "extra_published":
+					keys[3].Published = true
+				case "unpublished_old":
+					keys[2].Published = false
+				case "missing_companion":
+					keys = append(keys[:1], keys[2:]...)
+				case "extra_active":
+					keys[3].Active = true
+				case "companion_csk":
+					keys[1].KeyType = "csk"
+				case "companion_wrong_flags":
+					keys[1].DNSKEY = material
+				case "replacement_csk":
+					keys[0].KeyType = "csk"
+				case "duplicate_id":
+					keys[3].ID = replacement.ID
+				}
+				o := &retirementInventoryObserver{want: publishedKeys(keys)}
 				if scenario == "evidence_failure" {
 					o.err = errors.New("recursive DNSKEY evidence mismatch")
 				}
@@ -1751,7 +1772,7 @@ func TestDeleteOldRequiresFullPublishedInventory(t *testing.T) {
 					t.Fatal(err)
 				}
 				err := c.deleteOld(context.Background(), model.Zone{ID: w.Zone, Name: w.Zone}, keys, w)
-				if scenario == "evidence_failure" || scenario == "active_old" {
+				if scenario != "present" && scenario != "already_deleted" {
 					if err == nil || p.deletes != 0 {
 						t.Fatalf("unsafe retirement: err=%v deletes=%d", err, p.deletes)
 					}

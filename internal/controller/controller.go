@@ -1157,7 +1157,14 @@ func (c *Controller) deleteOld(ctx context.Context, zone model.Zone, keys []mode
 		return c.block(zone.Name, w.Kind, "active and published replacement key missing")
 	}
 	old, exists := byID(keys, w.OldKeyID)
-	dnskeys := publishedKeys(keys)
+	var dnskeys []model.Key
+	if w.Kind == model.KindZSK || w.Kind == model.KindKSK {
+		var err error
+		dnskeys, err = retirementInventory(zone.Name, keys, w)
+		if err != nil {
+			return c.block(zone.Name, w.Kind, err.Error())
+		}
+	}
 	if w.Kind == model.KindKSK || w.Kind == model.KindSplit {
 		if err := c.observer.DNSKEYRRSIGBy(ctx, zone.Name, newKey); err != nil {
 			return err
@@ -1211,6 +1218,49 @@ func (c *Controller) deleteOld(ctx context.Context, zone model.Zone, keys []mode
 		}
 	}
 	return c.complete(w)
+}
+
+func retirementInventory(zone string, keys []model.Key, w model.Workflow) ([]model.Key, error) {
+	if w.OldKeyID <= 0 || w.NewKeyID <= 0 || w.OldKeyID == w.NewKeyID {
+		return nil, errors.New("retirement requires distinct recorded old and new key IDs")
+	}
+	replacement, ok := byID(keys, w.NewKeyID)
+	if !ok || !replacement.Active || !replacement.Published {
+		return nil, errors.New("active and published replacement key missing")
+	}
+	data, err := validatedKeyRole(zone, replacement, string(w.Kind), false)
+	if err != nil {
+		return nil, err
+	}
+	companionRole := "ksk"
+	if w.Kind == model.KindKSK {
+		companionRole = "zsk"
+	}
+	companion, err := exactlyOneActive(keys, companionRole)
+	if err != nil || !companion.Published || companion.ID == w.OldKeyID || companion.ID == w.NewKeyID {
+		return nil, fmt.Errorf("retirement requires one distinct active and published companion %s", companionRole)
+	}
+	if _, err := validatedKeyRole(zone, companion, companionRole, false); err != nil {
+		return nil, err
+	}
+	expected := []model.Key{replacement, companion}
+	allowed := map[int]bool{replacement.ID: true, companion.ID: true}
+	if old, exists := byID(keys, w.OldKeyID); exists {
+		oldData, err := validatedKeyRole(zone, old, string(w.Kind), false)
+		if err != nil || old.Active || !old.Published || oldData.Algorithm != data.Algorithm {
+			return nil, errors.New("recorded old key has unexpected retirement role, algorithm, or publication state")
+		}
+		expected = append(expected, old)
+		allowed[old.ID] = true
+	}
+	seen := make(map[int]bool)
+	for _, key := range keys {
+		if seen[key.ID] || ((key.Active || key.Published) && !allowed[key.ID]) {
+			return nil, fmt.Errorf("unexpected or duplicate key %d at retirement", key.ID)
+		}
+		seen[key.ID] = true
+	}
+	return expected, nil
 }
 
 func jobSucceeded(status string) bool {
