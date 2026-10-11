@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -1693,7 +1694,10 @@ func TestDeleteAmbiguousSuccessReconcilesMissingOldKey(t *testing.T) {
 	if err := s.Update(func(st *model.State) error { st.Workflows[model.WorkflowKey(w.Zone, w.Kind)] = w; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	keys := []model.Key{{ID: 2, KeyType: "ksk", Active: true, Published: true, DNSKEY: "257 3 13 BAUG"}}
+	keys := []model.Key{
+		{ID: 2, KeyType: "ksk", Active: true, Published: true, DNSKEY: "257 3 13 BAUG"},
+		{ID: 3, KeyType: "zsk", Active: true, Published: true, DNSKEY: "256 3 13 BwgJ"},
+	}
 	if err := c.deleteOld(context.Background(), model.Zone{Name: w.Zone}, keys, w); err != nil {
 		t.Fatal(err)
 	}
@@ -1702,5 +1706,92 @@ func TestDeleteAmbiguousSuccessReconcilesMissingOldKey(t *testing.T) {
 	}
 	if got := s.Snapshot().Workflows[model.WorkflowKey(w.Zone, w.Kind)].Phase; got != model.PhaseIdle {
 		t.Fatalf("phase=%s", got)
+	}
+}
+
+type retirementInventoryObserver struct {
+	evidenceObserver
+	want []model.Key
+	err  error
+}
+
+func (o *retirementInventoryObserver) DNSKEYEvidence(_ context.Context, _ string, keys ...model.Key) (time.Duration, error) {
+	if !reflect.DeepEqual(keys, o.want) {
+		return 0, errors.New("DNSKEY set does not match the full published inventory")
+	}
+	return time.Hour, o.err
+}
+
+func TestDeleteOldRequiresFullPublishedInventory(t *testing.T) {
+	for _, kind := range []model.Kind{model.KindZSK, model.KindKSK} {
+		for _, scenario := range []string{"present", "already_deleted", "evidence_failure", "active_old", "extra_published", "unpublished_old", "missing_companion", "extra_active", "companion_csk", "companion_wrong_flags", "replacement_csk", "duplicate_id"} {
+			t.Run(string(kind)+"/"+scenario, func(t *testing.T) {
+				role, companionRole := "zsk", "ksk"
+				material, companionMaterial := "256 3 13 AQID", "257 3 13 BAUG"
+				if kind == model.KindKSK {
+					role, companionRole = companionRole, role
+					material, companionMaterial = companionMaterial, material
+				}
+				old := model.Key{ID: 1, KeyType: role, Published: true, DNSKEY: material}
+				replacement := model.Key{ID: 2, KeyType: role, Active: true, Published: true, DNSKEY: material}
+				companion := model.Key{ID: 3, KeyType: companionRole, Active: true, Published: true, DNSKEY: companionMaterial}
+				if scenario == "active_old" {
+					old.Active = true
+				}
+				published := []model.Key{replacement, companion}
+				if scenario != "already_deleted" {
+					published = append(published, old)
+				}
+				keys := append(append([]model.Key{}, published...), model.Key{ID: 4, KeyType: role, DNSKEY: material})
+				switch scenario {
+				case "extra_published":
+					keys[3].Published = true
+				case "unpublished_old":
+					keys[2].Published = false
+				case "missing_companion":
+					keys = append(keys[:1], keys[2:]...)
+				case "extra_active":
+					keys[3].Active = true
+				case "companion_csk":
+					keys[1].KeyType = "csk"
+				case "companion_wrong_flags":
+					keys[1].DNSKEY = material
+				case "replacement_csk":
+					keys[0].KeyType = "csk"
+				case "duplicate_id":
+					keys[3].ID = replacement.ID
+				}
+				o := &retirementInventoryObserver{want: publishedKeys(keys)}
+				if scenario == "evidence_failure" {
+					o.err = errors.New("recursive DNSKEY evidence mismatch")
+				}
+				p := &recordingPDNS{}
+				c, s := newTestController(t, p, o)
+				w := model.Workflow{Zone: "example.test.", Kind: kind, Phase: model.PhaseDeleteOld, OldKeyID: 1, NewKeyID: 2}
+				if err := s.Update(func(st *model.State) error { st.Workflows[model.WorkflowKey(w.Zone, w.Kind)] = w; return nil }); err != nil {
+					t.Fatal(err)
+				}
+				err := c.deleteOld(context.Background(), model.Zone{ID: w.Zone, Name: w.Zone}, keys, w)
+				if scenario != "present" && scenario != "already_deleted" {
+					if err == nil || p.deletes != 0 {
+						t.Fatalf("unsafe retirement: err=%v deletes=%d", err, p.deletes)
+					}
+					if s.Snapshot().Workflows[model.WorkflowKey(w.Zone, w.Kind)].Phase == model.PhaseIdle {
+						t.Fatal("unsafe retirement marked complete")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantDeletes := 1
+				if scenario == "already_deleted" {
+					wantDeletes = 0
+				}
+				if p.deletes != wantDeletes || s.Snapshot().Workflows[model.WorkflowKey(w.Zone, w.Kind)].Phase != model.PhaseIdle {
+					t.Fatalf("retirement not reconciled: deletes=%d want=%d", p.deletes, wantDeletes)
+				}
+			})
+		}
 	}
 }

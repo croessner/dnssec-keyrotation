@@ -27,6 +27,8 @@ The controller continuously reconciles every DNSSEC-enabled PowerDNS zone. It re
 - `deactivate-old`: re-prove the new KSK signature and parent DS, then deactivate the old KSK.
 - `delete-old`: re-prove all invariants and delete only the recorded inactive KSK. A missing old key after an ambiguous DELETE is reconciled as success only after replacement evidence passes.
 
+Before ordinary ZSK or KSK deletion, require a closed inventory containing the recorded active/published replacement, the recorded inactive/published old key if it still exists, and exactly one distinct active/published companion key of the other role. Validate DNSKEY roles and matching old/replacement algorithms; reject duplicate IDs and any additional active or published key. Compare the complete expected published RRset across every configured DNS path. An absent old key may reconcile an ambiguous successful deletion only after these same checks pass.
+
 ## CSK conversion
 
 CSK zones are reported as requiring an explicit migration. Automatic conversion is forbidden. The confirmed `split` workflow creates an active KSK and inactive ZSK; proves and waits DNSKEY propagation; replaces parent material and waits the full DS TTL; activates the ZSK; proves overlapping CSK and ZSK zone signatures for a full persisted zone TTL; deactivates the CSK; retains its DNSKEY for another full zone TTL; and only then re-proves KSK, ZSK, and parent evidence and deletes the CSK.
