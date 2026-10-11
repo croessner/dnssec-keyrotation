@@ -1157,10 +1157,7 @@ func (c *Controller) deleteOld(ctx context.Context, zone model.Zone, keys []mode
 		return c.block(zone.Name, w.Kind, "active and published replacement key missing")
 	}
 	old, exists := byID(keys, w.OldKeyID)
-	dnskeys := []model.Key{newKey}
-	if exists {
-		dnskeys = append(dnskeys, old)
-	}
+	dnskeys := publishedKeys(keys)
 	if w.Kind == model.KindKSK || w.Kind == model.KindSplit {
 		if err := c.observer.DNSKEYRRSIGBy(ctx, zone.Name, newKey); err != nil {
 			return err
@@ -1192,7 +1189,11 @@ func (c *Controller) deleteOld(ctx context.Context, zone model.Zone, keys []mode
 		if !remote.Enabled || !sameMaterial(remote.Data, []model.DNSSECData{expected}) {
 			return c.block(zone.Name, w.Kind, "InternetX material is not exact new-only KSK before old-key deletion")
 		}
-		dnskeys = append(dnskeys, z)
+		// Split migrations retain their closed, recorded-key inventory.
+		dnskeys = []model.Key{newKey, z}
+		if exists {
+			dnskeys = append(dnskeys, old)
+		}
 	case model.KindZSK:
 		if err := c.observer.RRSIGBy(ctx, zone.Name, newKey); err != nil {
 			return err
