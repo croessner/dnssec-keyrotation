@@ -76,13 +76,18 @@ jobs:
           base_digest="${base_image##*@}"
           base_name="${base_image%@*}"
 
-          tags="${IMAGE}:${version}"
+          tags="${IMAGE}:${RELEASE_TAG}"
+          # Preserve previously published unprefixed tags as compatibility aliases.
+          tags+=$'\n'"${IMAGE}:${version}"
           if [[ "$version" != *-* ]]; then
+            tags+=$'\n'"${IMAGE}:v${major}.${minor}"
+            tags+=$'\n'"${IMAGE}:v${major}"
             tags+=$'\n'"${IMAGE}:${major}.${minor}"
             tags+=$'\n'"${IMAGE}:${major}"
             tags+=$'\n'"${IMAGE}:latest"
           fi
           if [[ -n "$REBUILD_SUFFIX" ]]; then
+            tags+=$'\n'"${IMAGE}:${RELEASE_TAG}-${REBUILD_SUFFIX}"
             tags+=$'\n'"${IMAGE}:${version}-${REBUILD_SUFFIX}"
           fi
 
